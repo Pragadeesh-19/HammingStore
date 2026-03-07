@@ -1,0 +1,171 @@
+syntax = "proto3";
+
+package hammingstore;
+
+option java_package         = "io.hammingstore.grpc.proto";
+option java_outer_classname = "HammingStoreProto";
+option java_multiple_files  = true;
+
+// ============================================================================
+// HammingStore gRPC Service
+//
+// Binary vectors are transmitted as raw bytes — exactly 1,256 bytes
+// (157 longs × 8 bytes, little-endian packed).
+//
+// Clients must call GetProjectionConfig once on startup to fetch the seed
+// and input_dimensions, then construct an identical Gaussian projection matrix
+// to binarize their float embeddings before calling StoreBinary.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Shared types
+// ----------------------------------------------------------------------------
+
+message SearchResult {
+    int64  entity_id  = 1;   // matched entity ID
+    int64  distance   = 2;   // Hamming distance (lower = more similar)
+    double similarity = 3;   // normalized score in [0.0, 1.0]
+}
+
+message ProjectionConfig {
+    int64  seed             = 1;   // PRNG seed for Gaussian matrix generation
+    int32  input_dimensions = 2;   // float embedding dimension (e.g. 384, 1536)
+    int32  output_bits      = 3;   // always 10,048
+}
+
+// ----------------------------------------------------------------------------
+// Request / Response messages
+// ----------------------------------------------------------------------------
+
+message StoreBinaryRequest {
+    int64 entity_id  = 1;
+    bytes binary_vec = 2;   // exactly 1,256 bytes — pre-binarized by client
+}
+message StoreBinaryResponse {
+    bool success = 1;
+}
+
+message BindEdgeRequest {
+    int64 subject_id      = 1;
+    int64 object_id       = 2;
+    int64 relationship_id = 3;
+}
+message BindEdgeResponse {
+    bool success = 1;
+}
+
+message RetractRequest {
+    int64 entity_id = 1;
+}
+message RetractResponse {
+    bool success = 1;
+}
+
+message CheckpointRequest {
+    bool durable = 1;   // true = fsync (survives power loss); false = OS buffer only
+}
+message CheckpointResponse {
+    bool success = 1;
+}
+
+message QueryAnalogyRequest {
+    int64 subject_a_id = 1;   // e.g. London
+    int64 object_a_id  = 2;   // e.g. England
+    int64 subject_b_id = 3;   // e.g. France  →  result: Paris
+    int32 k            = 4;
+}
+message QueryAnalogyResponse {
+    repeated SearchResult results = 1;
+}
+
+message QuerySetRequest {
+    repeated int64 entity_ids = 1;
+    int32          k          = 2;
+}
+message QuerySetResponse {
+    repeated SearchResult results = 1;
+}
+
+message QueryRelationRequest {
+    int64 relation_id = 1;
+    int64 object_id   = 2;
+    int32 k           = 3;
+}
+message QueryRelationResponse {
+    repeated SearchResult results = 1;
+}
+
+message SearchBinaryRequest {
+    bytes binary_vec = 1;   // pre-binarized query, exactly 1,256 bytes
+    int32 k          = 2;
+}
+message SearchBinaryResponse {
+    repeated SearchResult results = 1;
+}
+
+message GetProjectionConfigRequest {}
+
+// ----------------------------------------------------------------------------
+// Service definition
+// ----------------------------------------------------------------------------
+
+service HammingStore {
+
+    // --- Writes ---
+
+    // Store a pre-binarized entity vector.
+    rpc StoreBinary (StoreBinaryRequest)  returns (StoreBinaryResponse);
+
+    // Bind a relational triple: subject ⊕ relationship ⊕ object → edge vector.
+    // All three entity IDs must already be stored via StoreBinary.
+    rpc BindEdge    (BindEdgeRequest)     returns (BindEdgeResponse);
+
+    // Tombstone an entity (logical retraction).
+    rpc Retract     (RetractRequest)      returns (RetractResponse);
+
+    // Flush mmap pages + write atomic snapshot. No-op in RAM mode.
+    rpc Checkpoint  (CheckpointRequest)   returns (CheckpointResponse);
+
+    // --- Reads ---
+
+    // Analogical reasoning: A is to B as C is to ?
+    rpc QueryAnalogy  (QueryAnalogyRequest)  returns (QueryAnalogyResponse);
+
+    // Set reasoning: bundle N entity vectors, find nearest concept.
+    rpc QuerySet      (QuerySetRequest)      returns (QuerySetResponse);
+
+    // Relation decoding: given relation + object, find subject.
+    rpc QueryRelation (QueryRelationRequest) returns (QueryRelationResponse);
+
+    // Raw HNSW search from a pre-binarized query vector.
+    rpc SearchBinary  (SearchBinaryRequest)  returns (SearchBinaryResponse);
+
+    // --- Metadata ---
+
+    // Fetch projection config. Call once on client startup.
+    rpc GetProjectionConfig (GetProjectionConfigRequest) returns (ProjectionConfig);
+
+    // Float-native: server binarizes the embedding, no client PRNG needed.
+    rpc StoreFloat  (StoreFloatRequest)  returns (StoreFloatResponse);
+    rpc SearchFloat (SearchFloatRequest) returns (SearchFloatResponse);
+}
+
+// --- Float-native RPCs (added Step 5) ---
+// Server binarizes the embedding — no client-side projection matrix needed.
+// float_vec = raw float32 bytes, length = input_dimensions × 4 (little-endian)
+
+message StoreFloatRequest {
+    int64 entity_id = 1;
+    bytes float_vec = 2;
+}
+message StoreFloatResponse {
+    bool success = 1;
+}
+
+message SearchFloatRequest {
+    bytes float_vec = 1;
+    int32 k         = 2;
+}
+message SearchFloatResponse {
+    repeated SearchResult results = 1;
+}
