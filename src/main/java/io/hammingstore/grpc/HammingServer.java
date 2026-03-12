@@ -40,7 +40,7 @@ public final class HammingServer {
      * @param repository the vector store; must be open and not yet closed
      * @throws IOException if the port cannot be bound
      */
-    public HammingServer(final int port, final VectorGraphRepository repository) throws IOException {
+    public HammingServer(final int port, final VectorGraphRepository repository, final long capacity) throws IOException {
 
         this.repository = repository;
 
@@ -57,7 +57,8 @@ public final class HammingServer {
                 + " | port="       + port
                 + " | mode="       + (repository.isDiskBacked() ? "DISK" : "RAM")
                 + " | dims="       + repository.projectionConfig().inputDimensions()
-                + " | maxVectors=" + repository.hnswIndex().size());
+                + " | capacity="   + capacity
+                + " | maxVectors=" + repository.nodeCount());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOG.info("Shutdown signal received - checkpointing...");
@@ -123,6 +124,6 @@ public final class HammingServer {
             repository = new VectorGraphRepository(maxVectors, config);
         }
 
-        new HammingServer(port, repository).awaitTermination();
+        new HammingServer(port, repository, maxVectors).awaitTermination();
     }
 }

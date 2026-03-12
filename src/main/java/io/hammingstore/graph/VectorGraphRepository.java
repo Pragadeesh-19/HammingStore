@@ -408,6 +408,10 @@ public final class VectorGraphRepository implements AutoCloseable{
         return encoder.config();
     }
 
+    public long nodeCount() {
+        return hnswIndex.layer(0).nodeCount();
+    }
+
     public HNSWIndex hnswIndex() { return hnswIndex; }
 
     public OffHeapVectorStore vectorStore() { return vectorStore; }

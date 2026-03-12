@@ -53,6 +53,7 @@
 
     <build>
         <sourceDirectory>src/main/java</sourceDirectory>
+        <testSourceDirectory>src/test/java</testSourceDirectory>
 
         <plugins>
             <plugin>
@@ -66,14 +67,12 @@
                         <configuration>
                             <protocVersion>3.25.1</protocVersion>
                             <outputTargets>
-                                <!-- Generates message classes -->
                                 <outputTarget>
                                     <type>java</type>
                                     <outputDirectory>
                                         ${project.build.directory}/generated-sources/protobuf/java
                                     </outputDirectory>
                                 </outputTarget>
-                                <!-- Generates gRPC service stubs -->
                                 <outputTarget>
                                     <type>grpc-java</type>
                                     <pluginArtifact>
@@ -89,7 +88,6 @@
                 </executions>
             </plugin>
 
-            <!-- Registers generated source directories with IntelliJ and javac -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>build-helper-maven-plugin</artifactId>
