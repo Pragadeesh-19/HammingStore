@@ -11,7 +11,21 @@ import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
-
+/**
+ * Entry point for the HammingStore gRPC server.
+ *
+ * <p>Constructs the service stack, wires the shutdown hook, and owns the server
+ * lifecycle. The constructor blocks only until the server has bound its port —
+ * callers must invoke {@link #awaitTermination()} to park the main thread.
+ *
+ * <h2>Shutdown</h2>
+ * <p>A JVM shutdown hook checkpoints the repository ({@code durable=true}) and
+ * drains in-flight RPCs with a 30-second grace period before closing the port.
+ * If {@link #stop()} is called explicitly before JVM exit, the hook will attempt
+ * to call it a second time. Both {@code server.shutdown()} (idempotent by gRPC
+ * contract) and {@link VectorGraphRepository#close()} (idempotent for mmap close)
+ * tolerate this safely.
+ */
 public final class HammingServer {
 
     private static final Logger LOG = Logger.getLogger(HammingServer.class.getName());
@@ -19,6 +33,13 @@ public final class HammingServer {
     private final Server server;
     private final VectorGraphRepository repository;
 
+    /**
+     * Starts the gRPC server on {@code port} backed by {@code repository}.
+     *
+     * @param port TCP port to listen on
+     * @param repository the vector store; must be open and not yet closed
+     * @throws IOException if the port cannot be bound
+     */
     public HammingServer(final int port, final VectorGraphRepository repository) throws IOException {
 
         this.repository = repository;
@@ -39,7 +60,7 @@ public final class HammingServer {
                 + " | maxVectors=" + repository.hnswIndex().size());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            LOG.info("Shutdown signal received — checkpointing...");
+            LOG.info("Shutdown signal received - checkpointing...");
             try {
                 repository.checkpoint(true);
             } catch (Exception e) {
@@ -63,11 +84,23 @@ public final class HammingServer {
         repository.close();
     }
 
+    /**
+     * Starts a HammingStore server from the command line.
+     *
+     * <p>Recognised flags:
+     * <pre>
+     *   --port=&lt;int&gt;          TCP port (default: 50051)
+     *   --max-vectors=&lt;long&gt;  Maximum vector capacity (default: 1 000 000)
+     *   --dims=&lt;int&gt;          Embedding input dimensions (default: 384, MiniLM)
+     *   --seed=&lt;long&gt;         Projection matrix PRNG seed (default: ProjectionConfig.DEFAULT_SEED)
+     *   --data-dir=&lt;path&gt;     Directory for disk-backed persistence (RAM mode if omitted)
+     * </pre>
+     */
     public static void main(final String[] args) throws IOException, InterruptedException {
 
         int port = 50051;
         long maxVectors = 1_000_000L;
-        int dims = ProjectionConfig.DIMS_MINILM;   // 384
+        int dims = ProjectionConfig.DIMS_MINILM;
         long seed = ProjectionConfig.DEFAULT_SEED;
         String dataDir = null;
 

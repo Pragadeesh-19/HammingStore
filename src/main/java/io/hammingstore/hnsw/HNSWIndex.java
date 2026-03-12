@@ -5,13 +5,39 @@ import io.hammingstore.memory.BinaryVector;
 import io.hammingstore.memory.OffHeapAllocator;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.StampedLock;
 
+/**
+ * Hierarchical Navigable Small World (HNSW) graph index for binary hypervectors.
+ *
+ * <p>HNSW is a proximity graph algorithm that supports approximate nearest-neighbour
+ * search in sub-linear time. The graph is organized into layers: layer 0 contains
+ * all nodes; each higher layer is an exponentially sparser subset that acts as an
+ * express lane to skip larger distances quickly. Inserts and searches both start at
+ * the top layer and work downward, refining the candidate set at each level.
+ *
+ * <p>Distance is measured as hamming distance between 10,048-bit binary vectors.
+ *
+ * <h2>Thread safety</h2>
+ * <p>Concurrent reads are supported via optimistically read with {@link StampedLock}.
+ * Writes acquire an exclusive write lock. Each thread maintains its own
+ * {@link SearchContext} via {@link ThreadLocal}, so no per-query allocation occurs on the
+ * hot path after warmup.
+ *
+ * <h2>Persistence</h2>
+ * <p>The two argument restore constructor accepts pre-built {@link HNSWLayer} arrays
+ * loaded from memoryMapped files by {@code VectorGraphRepository}. The {@code allocator}
+ * is set to {@code null} in that path; {@link #close()} handles this safely.
+ */
 public final class HNSWIndex implements AutoCloseable {
 
+    /**
+     * The result of a nearest-neighbour search: parallel arrays of entity IDs,
+     * Hamming distances, and cosine-equivalent similarities, with a count of
+     * how many results were actually populated.
+     */
     public record SearchResults(
             long[] entityIds,
             long[] distance,
@@ -30,30 +56,48 @@ public final class HNSWIndex implements AutoCloseable {
     private final StampedLock lock = new StampedLock();
 
     private volatile long entryPointOffset = -1L;
-    private AtomicInteger topLayer = new AtomicInteger(0);
+    private final AtomicInteger topLayer = new AtomicInteger(0);
     private final ThreadLocal<SearchContext> searchContextPool;
 
+    /**
+     * Creates a new empty index with fresh off-heap storage.
+     *
+     * @param maxNodes maximum number of vectors the index can hold
+     * @throws IllegalArgumentException if {@code maxNodes} is not positive
+     */
     public HNSWIndex(final long maxNodes) {
         if (maxNodes <= 0) throw new IllegalArgumentException("maxNodes must be > 0");
-        this.maxNodes      = maxNodes;
-        this.allocator     = new OffHeapAllocator(maxNodes);
+        this.maxNodes = maxNodes;
+        this.allocator = new OffHeapAllocator(maxNodes);
         this.maxLayerCount = computeMaxLayers(maxNodes);
-        this.layers        = new HNSWLayer[maxLayerCount];
+        this.layers = new HNSWLayer[maxLayerCount];
 
         for (int l = 0; l < maxLayerCount; l++) {
             layers[l] = new HNSWLayer(allocator, computeLayerCapacity(maxNodes, l), l);
         }
 
-        final long totalNodes = maxNodes;
         this.searchContextPool = ThreadLocal.withInitial(() ->
                 new SearchContext(
                         new CandidateMinHeap(HNSWConfig.EF_CONSTRUCTION),
                         new TopKBuffer(HNSWConfig.EF_CONSTRUCTION),
-                        new VisitedTracker(new OffHeapAllocator(totalNodes), totalNodes)
+                        new VisitedTracker(new OffHeapAllocator(maxNodes), maxNodes)
                 )
         );
     }
 
+    /**
+     * Restores an index from pre-built layers loaded from memory-mapped files.
+     * Used exclusively by {@link io.hammingstore.graph.VectorGraphRepository}
+     * during snapshot restore.
+     *
+     * <p>The {@code allocator} is set to {@code null} in this path - the layers own
+     * their own storage segments provided by the mapped file allocator.
+     *
+     * @param prebuildLayers layers loaded from mapped files.
+     * @param maxNodes maximum capacity the index was originally built for
+     * @param initialEntryPointOffset byte offset of the entry point node in layer 0
+     * @param initialTopLayer the highest populated layer at snapshot time.
+     */
     public HNSWIndex(
             final HNSWLayer[] prebuildLayers,
             final long maxNodes,
@@ -64,18 +108,25 @@ public final class HNSWIndex implements AutoCloseable {
         this.maxNodes = maxNodes;
         this.allocator = null;
         this.entryPointOffset = initialEntryPointOffset;
-        this.topLayer = new AtomicInteger(initialTopLayer);
+        this.topLayer.set(initialTopLayer);
 
-        final long totalNodes = maxNodes;
         this.searchContextPool = ThreadLocal.withInitial(() ->
                 new SearchContext(
                         new CandidateMinHeap(HNSWConfig.EF_CONSTRUCTION),
                         new TopKBuffer(HNSWConfig.EF_CONSTRUCTION),
-                        new VisitedTracker(new OffHeapAllocator(totalNodes), totalNodes)
+                        new VisitedTracker(new OffHeapAllocator(maxNodes), maxNodes)
                 )
         );
     }
 
+    /**
+     * Inserts a pre-binarized hypervector into the index.
+     *
+     * @param entityId the entity identifier to associate with this vector
+     * @param binaryVec the binary hypervector; must be exactly
+     *                  {@link BinaryVector#VECTOR_BYTES} bytes
+     * @throws IllegalArgumentException if the vector has the wrong size
+     */
     public void insertBinary(final long entityId, final MemorySegment binaryVec) {
         if (binaryVec.byteSize() != BinaryVector.VECTOR_BYTES) {
             throw new IllegalArgumentException(
@@ -89,12 +140,20 @@ public final class HNSWIndex implements AutoCloseable {
         }
     }
 
-    public void insert(final long entityId, final float[] denseEmbedding) {
-        final SearchContext ctx = searchContextPool.get();
-        binarizeInto(denseEmbedding, ctx.binaryScratch);
-        insertBinary(entityId, ctx.binaryScratch);
-    }
-
+    /**
+     * Searches for the {@code k} nearest stored vectors to {@code binaryQuery}
+     * using HNSW graph traversal.
+     *
+     * <p>Uses an optimistic read lock: if no write occurred during the search
+     * the result is returned immediately. If a concurrent write was detected,
+     * the search is retried under a full read lock.
+     *
+     * @param binaryQuery the query hypervector; must be exactly
+     *                    {@link BinaryVector#VECTOR_BYTES} bytes
+     * @param k number of nearest neighbours to return
+     * @return the k nearest results sorted by ascending Hamming distance
+     * @throws IllegalArgumentException if the query has the wrong size or k ≤ 0
+     */
     public SearchResults searchBinary(final MemorySegment binaryQuery, final int k) {
         if (binaryQuery.byteSize() != BinaryVector.VECTOR_BYTES) {
             throw new IllegalArgumentException(
@@ -115,12 +174,20 @@ public final class HNSWIndex implements AutoCloseable {
         return result;
     }
 
-    public SearchResults search(final float[] queryEmbedding, final int k) {
-        final SearchContext ctx = searchContextPool.get();
-        binarizeInto(queryEmbedding, ctx.binaryScratch);
-        return searchBinary(ctx.binaryScratch, k);
-    }
-
+    /**
+     * Linear scan over all layer-0 nodes returning the exact {@code k} nearest
+     * neighbours by Hamming distance.
+     *
+     * <p>This bypasses graph traversal entirely and is O(N). It is used as the
+     * authoritative search path while graph traversal correctness is being
+     * validated, and as a fallback for small datasets where HNSW provides no
+     * meaningful speedup.
+     *
+     * @param query the query hypervector
+     * @param k number of nearest neighbours to return
+     * @return the k nearest results sorted by ascending Hamming distance
+     * @throws IllegalArgumentException if k ≤ 0
+     */
     public SearchResults bruteForceSearch(final MemorySegment query, final int k) {
         if (k <= 0) throw new IllegalArgumentException("K must be > 0");
 
@@ -155,11 +222,31 @@ public final class HNSWIndex implements AutoCloseable {
         }
     }
 
+    /**
+     * Computes the number of HNSW layers needed for a dataset of {@code n} vectors.
+     * Formula: {@code min(ceil(log(n) / log(M)) + 2, MAX_LAYERS)}.
+     */
+    public static int computeMaxLayers(final long n) {
+        if (n <= 1) return 1;
+        return Math.min((int) Math.ceil(Math.log(n) / Math.log(HNSWConfig.M)) + 2,
+                HNSWConfig.MAX_LAYERS);
+    }
+
+    /**
+     * Computes the node capacity for layer {@code l} of an index with {@code n} total nodes.
+     * Layer 0 holds all nodes. Upper layers hold exponentially fewer nodes.
+     * A 20% margin is added to absorb random-level variance.
+     */
+    public static long computeLayerCapacity(final long n, final int l) {
+        if (l == 0) return n;
+        return Math.max(16L, (long) (n * Math.exp(-l) * 1.2));
+    }
+
     private void insertInternal(final long entityId, final MemorySegment binaryVec) {
         final int  nodeMaxLayer = randomLevel();
         final long currentEntryOffset = entryPointOffset;
         final int  currentTopLayer = topLayer.get();
-        long       entryOffset = currentEntryOffset;
+        long entryOffset = currentEntryOffset;
 
         if (entryOffset != -1L) {
             for (int l = currentTopLayer; l > nodeMaxLayer; l--) {
@@ -193,9 +280,8 @@ public final class HNSWIndex implements AutoCloseable {
             ctx.visited.reset();
 
             final int ef = (l == 0) ? HNSWConfig.EF_CONSTRUCTION : HNSWConfig.M;
-            layers[l].efSearch(entryOffset, binaryVec, ef, ctx.results, ctx.candidates, ctx.visited);
-
             final int mMax = (l == 0) ? HNSWConfig.M_LAYER_ZERO : HNSWConfig.M;
+            layers[l].efSearch(entryOffset, binaryVec, ef, ctx.results, ctx.candidates, ctx.visited);
             layers[l].connectNeighbors(newNodeOffset, ctx.results, mMax);
 
             if (l > 0 && ctx.results.size() > 0) {
@@ -243,13 +329,12 @@ public final class HNSWIndex implements AutoCloseable {
 
         final TopKBuffer resultsBuffer = (ctx.results.capacity() >= ef)
                 ? ctx.results : new TopKBuffer(ef);
-
         layers[0].efSearch(entryOffset, query, ef, resultsBuffer, ctx.candidates, ctx.visited);
         resultsBuffer.sortAscending();
 
         final int resultCount = Math.min(resultsBuffer.size(), k);
-        final long[]   entityIds    = new long[resultCount];
-        final long[]   distances    = new long[resultCount];
+        final long[] entityIds = new long[resultCount];
+        final long[] distances = new long[resultCount];
         final double[] similarities = new double[resultCount];
 
         for (int i = 0; i < resultCount; i++) {
@@ -293,22 +378,22 @@ public final class HNSWIndex implements AutoCloseable {
         }
 
         for (int i = 1; i < found; i++) {
-            final long keyOff  = topOffsets[i];
+            final long keyOff = topOffsets[i];
             final long keyDist = topDistances[i];
             int j = i - 1;
             while (j >= 0 && topDistances[j] > keyDist) {
-                topOffsets[j + 1]   = topOffsets[j];
+                topOffsets[j + 1] = topOffsets[j];
                 topDistances[j + 1] = topDistances[j];
                 j--;
             }
-            topOffsets[j + 1]   = keyOff;
+            topOffsets[j + 1] = keyOff;
             topDistances[j + 1] = keyDist;
         }
 
-        final long[]   entityIds    = new long[found];
+        final long[] entityIds = new long[found];
         final double[] similarities = new double[found];
         for (int i = 0; i < found; i++) {
-            entityIds[i]    = layers[0].viewAt(topOffsets[i]).getEntityId();
+            entityIds[i] = layers[0].viewAt(topOffsets[i]).getEntityId();
             similarities[i] = VectorMath.similarity(topDistances[i]);
         }
         return new SearchResults(entityIds, topDistances, similarities, found);
@@ -338,40 +423,19 @@ public final class HNSWIndex implements AutoCloseable {
         return Math.min((int) (-Math.log(safe) * HNSWConfig.ML), HNSWConfig.MAX_LAYERS - 1);
     }
 
-    private static void binarizeInto(final float[] embedding, final MemorySegment dest) {
-        dest.fill((byte) 0);
-        final int floatCount = Math.min(embedding.length, (int) VectorMath.TOTAL_BITS);
-        for (int i = 0; i < floatCount; i++) {
-            if (embedding[i] > 0.0f) {
-                final int  wordIndex = i >>> 6;
-                final int  bitIndex  = i & 63;
-                final long byteOff   = (long) wordIndex * Long.BYTES;
-                dest.set(ValueLayout.JAVA_LONG_UNALIGNED, byteOff,
-                        dest.get(ValueLayout.JAVA_LONG_UNALIGNED, byteOff) | (1L << bitIndex));
-            }
-        }
-    }
-
-    public static int computeMaxLayers(final long n) {
-        if (n <= 1) return 1;
-        return Math.min((int) Math.ceil(Math.log(n) / Math.log(HNSWConfig.M)) + 2,
-                HNSWConfig.MAX_LAYERS);
-    }
-
-    public static long computeLayerCapacity(final long n, final int l) {
-        if (l == 0) return n;
-        return Math.max(16L, (long) (n * Math.exp(-l) * 1.2));
-    }
-
+    /**
+     * Per-thread scratch buffers reused across search and insert operations.
+     *
+     * <p>All three components are allocated once per thread and reset between
+     * operations via {@link CandidateMinHeap#reset()}, {@link TopKBuffer#reset()},
+     * and {@link VisitedTracker#reset()}.
+     *
+     * <p>This is a record so all fields are {@code final} and the compiler
+     * enforces that no component is accidentally shared across threads.
+     */
     private record SearchContext(
             CandidateMinHeap candidates,
-            TopKBuffer       results,
-            VisitedTracker   visited
-    ) {
-        static MemorySegment binaryScratch;
-        SearchContext {
-            binaryScratch = new OffHeapAllocator(1L).allocateRawSegment(
-                    BinaryVector.VECTOR_BYTES, Long.BYTES);
-        }
-    }
+            TopKBuffer results,
+            VisitedTracker visited
+    ) {}
 }

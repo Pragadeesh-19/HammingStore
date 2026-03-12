@@ -17,9 +17,36 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
-import java.util.Arrays;
+import java.util.Optional;
 import java.util.concurrent.locks.StampedLock;
 
+/**
+ * Central access point for storing and retrieving binary hypervectors.
+ *
+ * <p>Combines three subsystems into a single thread-safe unit:
+ * <ul>
+ *     <li><b>Flat vector store</b> ({@link OffHeapVectorStore}) - sequential off-heap
+ *            slab that holds every stored binary vector. Addressed by slot index.</li>
+ *     <li><b>Entity index</b> ({@link SparseEntityIndex}) - hashmap from entity ID to
+ *            the slot offset of its vector in the flat array</li>
+ *     <li><b>HNSW graph</b> ({@link HNSWIndex}) — proximity graph for approximate
+ *            nearest-neighbour search over binary hypervectors.</li>
+ * </ul>
+ *
+ * <h2>Thread safety</h2>
+ * <p>All public methods are thread-safe via {@link StampedLock}. Writes acquire
+ * an exclusive write lock; reads use an optimistic reads with a fallback to a shared
+ * read lock. Note that {@code insertBinary} inside {@link HNSWIndex} also holds its
+ * own internal lock - the two locks are different instances so no deadlock is possible,
+ * but the index lock is redundant whenever the repository write lock is
+ * already held. this is a known inefficiency, not a correctness issue.
+ *
+ * <h2>Persistence</h2>
+ * <p>Use {@link #openFromDisk} for disk backed repository whose data survives
+ * process restarts. Use the public constructors for an ephemeral in-RAM repository.
+ * In RAM mode, {@link #checkpoint} is no-op.
+ *
+ */
 public final class VectorGraphRepository implements AutoCloseable{
 
     public record SearchResult(long entityOffset, long hammingDistance, double similarity)
@@ -30,6 +57,11 @@ public final class VectorGraphRepository implements AutoCloseable{
         }
     }
 
+    /**
+     * Byte size of one vector slot in the flat store.
+     * Alias for {@link BinaryVector#VECTOR_BYTES} kept private to reduce noise
+     * inside this class.
+     */
     private static final long SLOT_BYTES = BinaryVector.VECTOR_BYTES;
 
     private final OffHeapVectorStore vectorStore;
@@ -44,25 +76,42 @@ public final class VectorGraphRepository implements AutoCloseable{
 
     private final ThreadLocal<MemorySegment> encodeScratch;
 
+    /**
+     * Creates an in-RAM repository with the given capacity and projection config.
+     *
+     * @param maxVectors maximum number of vectors the repository can hold
+     * @param projectionConfig the encoder configuration (input dimensions, seed)
+     * @throws IllegalArgumentException if {@code maxVectors} ≤ 1
+     */
     public VectorGraphRepository(final long maxVectors, final ProjectionConfig projectionConfig) {
         if (maxVectors <= 1) throw new IllegalArgumentException("maxVectors must be > 1");
 
-        final OffHeapAllocator flatAllocator = new OffHeapAllocator(maxVectors);
-        this.vectorStore = new OffHeapVectorStore(flatAllocator, maxVectors);
-        this.entityIndex = new SparseEntityIndex(flatAllocator, maxVectors);
-        this.bindScratch = flatAllocator.allocateRawSegment(SLOT_BYTES, Long.BYTES);
-        this.encoder = new RandomProjectionEncoder(flatAllocator, projectionConfig);
+        final OffHeapAllocator allocator = new OffHeapAllocator(maxVectors);
+        this.vectorStore = new OffHeapVectorStore(allocator, maxVectors);
+        this.entityIndex = new SparseEntityIndex(allocator, maxVectors);
+        this.bindScratch = allocator.allocateRawSegment(SLOT_BYTES, Long.BYTES);
+        this.encoder = new RandomProjectionEncoder(allocator, projectionConfig);
         this.hnswIndex = new HNSWIndex(maxVectors);
         this.mappedAllocator = null;
         this.dataDir = null;
         this.encodeScratch = ThreadLocal.withInitial(() ->
-                flatAllocator.allocateRawSegment(SLOT_BYTES, Long.BYTES));
+                allocator.allocateRawSegment(SLOT_BYTES, Long.BYTES));
     }
 
-    public VectorGraphRepository(final long maxVectors) {
-        this(maxVectors, ProjectionConfig.of(ProjectionConfig.DIMS_MINILM));
-    }
-
+    /**
+     * Opens a disk-backed repository, or creates a new one
+     * if no snapshot exists there yet.
+     *
+     * <p>Uses memory-mapped files for zero-copy persistence. Data survives
+     * process restarts. Call {@link #checkpoint} periodically and on shutdown
+     * to commit in-flight state to the snapshot file.
+     *
+     * @param dataDir directory where snapshot and data files live.
+     * @param projectionConfig the encoder configuration; must match the snapshot
+     *                         if one exists, otherwise it is used to create a fresh one
+     * @param maxVectors maximum number of vectors the repository can hold.
+     * @throws UncheckedIOException if the snapshot or data files cannot be read or created.
+     */
     public static VectorGraphRepository openFromDisk(
             final Path dataDir,
             final ProjectionConfig projectionConfig,
@@ -79,79 +128,80 @@ public final class VectorGraphRepository implements AutoCloseable{
             final ProjectionConfig projectionConfig,
             final long maxVectors) throws IOException {
 
-        // Read existing snapshot or create fresh state
-        EngineSnapshot snap = EngineSnapshot.readFrom(dataDir);
-        final boolean isNew = (snap == null);
+        final Optional<EngineSnapshot> maybeSnap = EngineSnapshot.readFrom(dataDir);
+        final EngineSnapshot snap;
 
-        if (isNew) {
-            final int layerCount = HNSWIndex.computeMaxLayers(maxVectors);
+        if (maybeSnap.isEmpty()) {
             snap = EngineSnapshot.fresh(
                     projectionConfig.inputDimensions(),
                     projectionConfig.seed(),
-                    layerCount);
+                    HNSWIndex.computeMaxLayers(maxVectors));
         } else {
+            snap = maybeSnap.get();
             snap.validateProjectionConfig(
                     projectionConfig.inputDimensions(), projectionConfig.seed());
         }
 
         final MappedFileAllocator mfa = new MappedFileAllocator(dataDir);
 
-        // ---- Flat vector store ----
-        final long vectorStoreBytes = maxVectors * SLOT_BYTES;
-        final MemorySegment vectorStoreSeg = mfa.map("vector_store.dat", vectorStoreBytes);
+        final MemorySegment vectorStoreSeg = mfa.map(
+                "vector_store.dat", maxVectors * SLOT_BYTES);
         final OffHeapVectorStore vectorStore = OffHeapVectorStore.fromMapped(
-                vectorStoreSeg, maxVectors, snap.vectorCursorSlots);
+                vectorStoreSeg, maxVectors, snap.vectorCursorSlots());
 
-        // ---- Entity index ----
-        final long entityIndexBytes = SparseEntityIndex.tableByteSize(maxVectors);
-        final long entityIndexCap   = SparseEntityIndex.tableCapacity(maxVectors);
-        final MemorySegment entityIndexSeg = mfa.map("entity_index.dat", entityIndexBytes);
+        final MemorySegment entityIndexSeg = mfa.map(
+                "entity_index.dat", SparseEntityIndex.tableByteSize(maxVectors));
         final SparseEntityIndex entityIndex = SparseEntityIndex.fromMapped(
-                entityIndexSeg, entityIndexCap, maxVectors, snap.indexEntryCount);
+                entityIndexSeg,
+                SparseEntityIndex.tableCapacity(maxVectors),
+                maxVectors,
+                snap.indexEntryCount());
 
-        // ---- HNSW layers ----
         final int hnswLayerCount = HNSWIndex.computeMaxLayers(maxVectors);
         final HNSWLayer[] layers = new HNSWLayer[hnswLayerCount];
 
-        for (int l = 0; l < hnswLayerCount; l++) {
-            final long layerCapacity = HNSWIndex.computeLayerCapacity(maxVectors, l);
+        final long[] layerNodeCounts = snap.layerNodesCounts(); // defensive copy via accessor
+        final long[] nodeIndexSizes  = snap.nodeIndexSizes();
 
-            // Node storage file for this layer
+        for (int l = 0; l < hnswLayerCount; l++) {
+            final long layerCapacity  = HNSWIndex.computeLayerCapacity(maxVectors, l);
+            final long committedNodes = (l < EngineSnapshot.MAX_LAYERS)
+                    ? layerNodeCounts[l] : 0L;
+            final long committedIdxSz = (l < EngineSnapshot.MAX_LAYERS)
+                    ? nodeIndexSizes[l]  : 0L;
+
             final MemorySegment nodesSeg = mfa.map(
                     "hnsw_nodes_L" + l + ".dat",
                     layerCapacity * HNSWConfig.NODE_BYTES);
 
-            // Node index file for this layer
-            final long nodeIndexBytes = SparseEntityIndex.tableByteSize(layerCapacity);
-            final long nodeIndexCap   = SparseEntityIndex.tableCapacity(layerCapacity);
-            final MemorySegment nodeIndexSeg = mfa.map("hnsw_index_L" + l + ".dat", nodeIndexBytes);
-
-            final long committedNodes = (l < EngineSnapshot.MAX_LAYERS)
-                    ? snap.layerNodeCounts[l] : 0L;
-            final long committedIdxSz = (l < EngineSnapshot.MAX_LAYERS)
-                    ? snap.nodeIndexSizes[l]  : 0L;
+            final MemorySegment nodeIndexSeg = mfa.map(
+                    "hnsw_index_L" + l + ".dat",
+                    SparseEntityIndex.tableByteSize(layerCapacity));
 
             final SparseEntityIndex nodeIdx = SparseEntityIndex.fromMapped(
-                    nodeIndexSeg, nodeIndexCap, layerCapacity, committedIdxSz);
+                    nodeIndexSeg,
+                    SparseEntityIndex.tableCapacity(layerCapacity),
+                    layerCapacity,
+                    committedIdxSz);
 
-            layers[l] = HNSWLayer.fromMapped(nodesSeg, nodeIdx, layerCapacity, l, committedNodes);
+            layers[l] = HNSWLayer.fromMapped(
+                    nodesSeg, nodeIdx, layerCapacity, l, committedNodes);
         }
 
         final HNSWIndex hnswIndex = new HNSWIndex(
                 layers, maxVectors,
-                snap.hnswEntryPointOffset,
-                snap.hnswTopLayer);
+                snap.hnswEntryPointOffset(),
+                snap.hnswTopLayer());
 
-        // ---- Encoder (always RAM — regenerated from seed, fast) ----
-        final OffHeapAllocator encoderAllocator = new OffHeapAllocator(
-                (long) Math.ceil((double) projectionConfig.outputBits()
-                        * projectionConfig.inputDimensions() * Float.BYTES / SLOT_BYTES) + 2L);
-        final RandomProjectionEncoder encoder =
-                new RandomProjectionEncoder(encoderAllocator, projectionConfig);
+        final long encoderSlots = (long) Math.ceil(
+                (double) projectionConfig.outputBits()
+                        * projectionConfig.inputDimensions()
+                        * Float.BYTES / SLOT_BYTES) + 2L;
+        final RandomProjectionEncoder encoder = new RandomProjectionEncoder(
+                new OffHeapAllocator(encoderSlots), projectionConfig);
 
-        // ---- Bind scratch (tiny, RAM) ----
-        final OffHeapAllocator scratchAllocator = new OffHeapAllocator(4L);
-        final MemorySegment bindScratch = scratchAllocator.allocateRawSegment(SLOT_BYTES, Long.BYTES);
+        final MemorySegment bindScratch = new OffHeapAllocator(4L)
+                .allocateRawSegment(SLOT_BYTES, Long.BYTES);
 
         return new VectorGraphRepository(
                 vectorStore, entityIndex, hnswIndex, encoder, bindScratch, mfa, dataDir);
@@ -160,11 +210,11 @@ public final class VectorGraphRepository implements AutoCloseable{
     private VectorGraphRepository(
             final OffHeapVectorStore vectorStore,
             final SparseEntityIndex  entityIndex,
-            final HNSWIndex          hnswIndex,
+            final HNSWIndex hnswIndex,
             final RandomProjectionEncoder encoder,
-            final MemorySegment      bindScratch,
+            final MemorySegment bindScratch,
             final MappedFileAllocator mappedAllocator,
-            final Path               dataDir) {
+            final Path dataDir) {
         this.vectorStore = vectorStore;
         this.entityIndex = entityIndex;
         this.hnswIndex = hnswIndex;
@@ -178,24 +228,50 @@ public final class VectorGraphRepository implements AutoCloseable{
         });
     }
 
+    /**
+     * Encodes {@code denseEmbedding} using the configured {@link RandomProjectionEncoder}
+     * and stores the resulting binary vector under {@code entityId}.
+     *
+     * @param entityId the entity identifier
+     * @param denseEmbedding the float embedding to binarise and store;
+     *                       length must match {@link ProjectionConfig#inputDimensions()}
+     */
     public void store(final long entityId, final float[] denseEmbedding) {
         final MemorySegment scratch = encodeScratch.get();
         encoder.encode(denseEmbedding, scratch);
         storeBinary(entityId, scratch);
     }
 
+    /**
+     * Stores a pre-binarised hypervector under {@code entityId}.
+     *
+     * @param entityId the entity identifier
+     * @param binaryVec the binary hypervector; must be exactly {@link BinaryVector#VECTOR_BYTES} bytes
+     */
     public void storeBinary(final long entityId, final MemorySegment binaryVec) {
         final long stamp = lock.writeLock();
         try {
             final long slot = vectorStore.allocateSlot();
             vectorStore.copyInto(slot, binaryVec);
-            entityIndex.put(SparseEntityIndex.xxHash3Stub(entityId), slot);
+            entityIndex.put(SparseEntityIndex.mixHash64(entityId), slot);
             hnswIndex.insertBinary(entityId, binaryVec);
         } finally {
             lock.unlockWrite(stamp);
         }
     }
 
+    /**
+     * Binds a subject-relation-object triple into a composite edge vector and
+     * inserts it into the graph.
+     *
+     * <p>The edge vector is computed as {@code bind(bind(subject, relation), object)}
+     * using XOR binding. The composite entity ID is {@code subjectId ^ relationshipId ^ objectId}.
+     *
+     * @param subjectId entity ID of the subject
+     * @param objectId entity ID of the object
+     * @param relationshipId entity ID of the relation
+     * @throws IllegalArgumentException if any of the three entity IDs is not found in the index
+     */
     public void bindRelationalEdge(
             final long subjectId,
             final long objectId,
@@ -203,9 +279,9 @@ public final class VectorGraphRepository implements AutoCloseable{
 
         final long stamp = lock.writeLock();
         try {
-            final MemorySegment sv = resolveVector(subjectId,      "subject");
-            final MemorySegment ov = resolveVector(objectId,       "object");
-            final MemorySegment rv = resolveVector(relationshipId, "relationship");
+            final MemorySegment sv = resolveVector(subjectId,"subject");
+            final MemorySegment ov = resolveVector(objectId,"object");
+            final MemorySegment rv = resolveVector(relationshipId,"relationship");
 
             VectorMath.bind(sv, rv, bindScratch);
             VectorMath.bind(bindScratch, ov, bindScratch);
@@ -214,17 +290,24 @@ public final class VectorGraphRepository implements AutoCloseable{
             vectorStore.copyInto(edgeSlot, bindScratch);
 
             final long compositeId = subjectId ^ relationshipId ^ objectId;
-            entityIndex.put(SparseEntityIndex.xxHash3Stub(compositeId), edgeSlot);
+            entityIndex.put(SparseEntityIndex.mixHash64(compositeId), edgeSlot);
             hnswIndex.insertBinary(compositeId, bindScratch);
         } finally {
             lock.unlockWrite(stamp);
         }
     }
 
+    /**
+     * Tombstones {@code entityId} in the entity index so it no longer resolves
+     * to a vector. Does not remove it from the HNSW graph (graph nodes are
+     * immutable after insertion).
+     *
+     * @param entityId the entity to retract
+     */
     public void retract(final long entityId) {
         final long stamp = lock.writeLock();
         try {
-            final long hash   = SparseEntityIndex.xxHash3Stub(entityId);
+            final long hash   = SparseEntityIndex.mixHash64(entityId);
             final long offset = entityIndex.getOffset(hash);
             if (offset >= 0) {
                 entityIndex.put(hash, Long.MIN_VALUE); // tombstone
@@ -234,14 +317,20 @@ public final class VectorGraphRepository implements AutoCloseable{
         }
     }
 
-    public void checkpoint() {
-        checkpoint(false);
-    }
-
+    /**
+     * Commits the current state to disk (no-op in RAM mode).
+     *
+     * <p>Flushes dirty memory-mapped pages and writes an atomic snapshot file
+     * via temp-file rename. If {@code durable} is {@code true}, the allocator
+     * forces an {@code fsync} before the snapshot is written.
+     *
+     * @param durable if {@code true}, performs an fsync to guarantee data is
+     *                on durable storage before returning
+     * @throws UncheckedIOException if the snapshot file cannot be written
+     */
     public void checkpoint(final boolean durable) {
-        if (mappedAllocator == null) return; // RAM mode — no-op
+        if (mappedAllocator == null) return;
 
-        // Snapshot cursor values under read lock so we get a consistent view
         final long vecCursor;
         final long idxCount;
         final int  hnswTopLayer;
@@ -251,10 +340,10 @@ public final class VectorGraphRepository implements AutoCloseable{
 
         final long stamp = lock.readLock();
         try {
-            vecCursor    = vectorStore.allocatedSlots();
-            idxCount     = entityIndex.size();
+            vecCursor = vectorStore.allocatedSlots();
+            idxCount = entityIndex.size();
             hnswTopLayer = hnswIndex.activeLayerCount() - 1;
-            hnswEntryPt  = hnswIndex.entryPointOffset();
+            hnswEntryPt = hnswIndex.entryPointOffset();
             final int layerCount = hnswIndex.activeLayerCount();
             for (int l = 0; l < Math.min(layerCount, EngineSnapshot.MAX_LAYERS); l++) {
                 layerNodeCounts[l] = hnswIndex.layer(l).nodeCount();
@@ -264,10 +353,8 @@ public final class VectorGraphRepository implements AutoCloseable{
             lock.unlockRead(stamp);
         }
 
-        // Phase 1: flush dirty mmap pages BEFORE writing the snapshot
         mappedAllocator.force(durable);
 
-        // Phase 2: write snapshot atomically (temp file + rename)
         final EngineSnapshot snap = new EngineSnapshot(
                 1,
                 encoder.config().inputDimensions(),
@@ -286,47 +373,40 @@ public final class VectorGraphRepository implements AutoCloseable{
         }
     }
 
+    /**
+     * Encodes {@code queryEmbedding} and searches the HNSW graph for the {@code k}
+     * nearest stored vectors.
+     *
+     * @param queryEmbedding the float query embedding
+     * @param k              number of nearest neighbours to return
+     * @return search results sorted by ascending Hamming distance
+     */
     public HNSWIndex.SearchResults searchHNSW(final float[] queryEmbedding, final int k) {
         final MemorySegment scratch = encodeScratch.get();
         encoder.encode(queryEmbedding, scratch);
         return hnswIndex.searchBinary(scratch, k);
     }
 
+    /**
+     * Searches the HNSW graph for the {@code k} nearest stored vectors to a
+     * pre-binarised query.
+     *
+     * @param binaryQuery the binary query hypervector;
+     *                    must be exactly {@link BinaryVector#VECTOR_BYTES} bytes
+     * @param k           number of nearest neighbours to return
+     * @return search results sorted by ascending Hamming distance
+     */
     public HNSWIndex.SearchResults searchHNSWBinary(final MemorySegment binaryQuery, final int k) {
         return hnswIndex.searchBinary(binaryQuery, k);
     }
 
-    public HNSWIndex.SearchResults searchHNSWBruteForce(final float[] queryEmbeddings, final int k) {
-        final MemorySegment scratch = encodeScratch.get();
-        encoder.encode(queryEmbeddings, scratch);
-        return hnswIndex.bruteForceSearch(scratch, k);
-    }
-
-    public SearchResult[] searchNearest(
-            final MemorySegment queryVector,
-            final double similarityThreshold,
-            final int maxResults) {
-
-        if (queryVector.byteSize() != SLOT_BYTES)
-            throw new IllegalArgumentException("queryVector must be " + SLOT_BYTES + " bytes");
-        if (maxResults <= 0)
-            throw new IllegalArgumentException("maxResults must be > 0");
-
-        long stamp = lock.tryOptimisticRead();
-        SearchResult[] result = bruteForce(queryVector, similarityThreshold, maxResults);
-        if (!lock.validate(stamp)) {
-            stamp = lock.readLock();
-            try { result = bruteForce(queryVector, similarityThreshold, maxResults); }
-            finally { lock.unlockRead(stamp); }
-        }
-        return result;
-    }
-
+    /**
+     * Returns the projection configuration this repository was built with.
+     * Used by the gRPC service to return encoder metadata to clients.
+     */
     public ProjectionConfig projectionConfig() {
         return encoder.config();
     }
-
-    public RandomProjectionEncoder encoder() { return encoder; }
 
     public HNSWIndex hnswIndex() { return hnswIndex; }
 
@@ -342,64 +422,12 @@ public final class VectorGraphRepository implements AutoCloseable{
         if (mappedAllocator != null) mappedAllocator.close();
     }
 
-    private SearchResult[] bruteForce(
-            final MemorySegment query,
-            final double similarityThreshold,
-            final int maxResults) {
-
-        final long maxDist   = VectorMath.similarityToMaxDistance(similarityThreshold);
-        final long populated = vectorStore.allocatedSlots();
-        final MemorySegment store = vectorStore.rawStorage();
-
-        final long[] offsets   = new long[maxResults];
-        final long[] distances = new long[maxResults];
-        int count = 0; long worstDist = maxDist;
-
-        for (long slot = 0; slot < populated; slot++) {
-            final long byteOff = slot * SLOT_BYTES;
-            final long dist    = VectorMath.hammingDistance(
-                    query, store.asSlice(byteOff, SLOT_BYTES));
-            if (dist > worstDist) continue;
-            if (count < maxResults) {
-                offsets[count] = byteOff; distances[count] = dist; count++;
-                if (count == maxResults) worstDist = maxInArray(distances, count);
-            } else {
-                final int wi = indexOfMax(distances, count);
-                if (dist < distances[wi]) {
-                    offsets[wi] = byteOff; distances[wi] = dist;
-                    worstDist = maxInArray(distances, count);
-                }
-            }
-        }
-
-        final SearchResult[] r = new SearchResult[count];
-        for (int i = 0; i < count; i++) {
-            r[i] = new SearchResult(
-                    offsets[i], distances[i], VectorMath.similarity(distances[i]));
-        }
-        Arrays.sort(r);
-        return r;
-    }
-
     private MemorySegment resolveVector(final long entityId, final String role) {
-        final long offset = entityIndex.getOffset(SparseEntityIndex.xxHash3Stub(entityId));
+        final long offset = entityIndex.getOffset(SparseEntityIndex.mixHash64(entityId));
         if (offset < 0L || offset == Long.MIN_VALUE) {
             throw new IllegalArgumentException(
                     "Entity not found (or retracted) for " + role + " id=" + entityId);
         }
         return vectorStore.sliceAt(offset);
     }
-
-    private static long maxInArray(final long[] a, final int len) {
-        long m = Long.MIN_VALUE;
-        for (int i = 0; i < len; i++) if (a[i] > m) m = a[i];
-        return m;
-    }
-
-    private static int indexOfMax(final long[] a, final int len) {
-        int idx = 0;
-        for (int i = 1; i < len; i++) if (a[i] > a[idx]) idx = i;
-        return idx;
-    }
-
 }

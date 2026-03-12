@@ -134,7 +134,7 @@ public final class OffHeapVectorStore {
     }
 
     private void validateOffset(final long byteOffset) {
-        if (byteOffset < 0 || byteOffset * SLOT_BYTES > storage.byteSize()) {
+        if (byteOffset < 0 || byteOffset + SLOT_BYTES > storage.byteSize()) {
             throw new IllegalArgumentException(
                     "byteOffset " + byteOffset + " out of range [0, " + storage.byteSize() + ")"
             );

@@ -1,5 +1,22 @@
 package io.hammingstore.hnsw;
 
+/**
+ * A fixed-capacity binary min-heap ordered by Hamming distance.
+ *
+ * <p>Used as the exploration frontier during HNSW beam search. At each step,
+ * the candidate with the smallest distance to the query is expanded first,
+ * ensuring the search explores the most promising region of the graph before
+ * less promising ones.
+ *
+ * <p>The heap stores two parallel arrays — {@code offsets} (byte offsets into
+ * the layer's storage segment) and {@code distances} (Hamming distances to the
+ * query vector) — kept in sync by every heap operation. The heap invariant is
+ * maintained on {@code distances}: {@code distances[parent] ≤ distances[child]}
+ * for all nodes.
+ *
+ * <p>Instances are not thread-safe. Each search context ({@code HNSWIndex.SearchContext})
+ * owns a dedicated heap and resets it via {@link #reset()}
+ */
 public final class CandidateMinHeap {
 
     private final long[] offsets;
@@ -7,6 +24,12 @@ public final class CandidateMinHeap {
     private final int capacity;
     private int size;
 
+    /**
+     * Creates a heap with the given fixed capacity.
+     *
+     * @param capacity maximum number of candidates the heap can hold
+     * @throws IllegalArgumentException if {@code capacity} is not positive
+     */
     public CandidateMinHeap(final int capacity) {
         if (capacity <= 0) throw new IllegalArgumentException("capacity must be > 0");
         this.capacity  = capacity;
@@ -15,6 +38,13 @@ public final class CandidateMinHeap {
         this.size      = 0;
     }
 
+    /**
+     * Inserts a candidate into the heap.
+     *
+     * @param offset byte offset of the candidate node in the layer's storage segment
+     * @param distance Hamming distance from the candidate to the query vector
+     * @throws IllegalStateException if the heap is already at capacity
+     */
     public void push(final long offset, final long distance) {
         if (size >= capacity) {
             throw new IllegalStateException("CandidateMinHeap full at capacity=" + capacity);
@@ -25,6 +55,12 @@ public final class CandidateMinHeap {
         size++;
     }
 
+    /**
+     * Removes and returns the byte offset of the minimum-distance candidate.
+     *
+     * @return the byte offset of the nearest candidate
+     * @throws IllegalStateException if the heap is empty
+     */
     public long popMinOffset() {
         if (size == 0) throw new IllegalStateException("CandidateMinHeap is empty");
         final long result = offsets[0];
@@ -37,26 +73,23 @@ public final class CandidateMinHeap {
         return result;
     }
 
+    /**
+     * Returns the minimum distance without removing the candidate.
+     * Returns {@link Long#MAX_VALUE} if the heap is empty, so callers can use
+     * it as a pruning threshold without a separate emptiness check.
+     */
     public long peekMinDistance() {
         return size == 0 ? Long.MAX_VALUE : distances[0];
-    }
-
-    public long popMinDistance() {
-        if (size == 0) throw new IllegalStateException("CandidateMinHeap is empty");
-        final long result = distances[0];
-        size--;
-        if (size > 0) {
-            offsets[0]   = offsets[size];
-            distances[0] = distances[size];
-            siftDown(0);
-        }
-        return result;
     }
 
     public int size() { return size; }
 
     public boolean isEmpty() { return size == 0; }
 
+    /**
+     * Discards all candidates without releasing storage.
+     * Called between searches to reuse the heap allocation across queries.
+     */
     public void reset() { size = 0; }
 
     private void siftUp(int i) {

@@ -6,6 +6,21 @@ import io.hammingstore.memory.SparseEntityIndex;
 import java.lang.foreign.MemorySegment;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * One layer of the HNSW proximity graph.
+ *
+ * <p>Each layer holds a flat array of fixed-size nodes in off-heap memory.
+ * Every node contains an entity ID, a binary hypervector, a neighbour count,
+ * the node's max layer assignment, and up to {@link HNSWConfig#M} neighbour
+ * offsets. See {@link HNSWConfig} for the exact byte layout.
+ *
+ * <p>An accompanying {@link SparseEntityIndex} maps entity IDs to their byte
+ * offsets within this layer's storage segment, enabling O(1) entity lookup.
+ *
+ * <h2>Visibility contract</h2>
+ * <p>Methods used only by {@link HNSWIndex} (same package) are package-private.
+ * Methods used by {@code VectorGraphRepository} for persistence are public.
+ */
 public final class HNSWLayer {
 
     private final MemorySegment storage;
@@ -14,6 +29,14 @@ public final class HNSWLayer {
     private final long capacity;
     private final int layerIndex;
 
+    /**
+     * Creates a new empty layer with freshly allocated off-heap storage.
+     *
+     * @param allocator the allocator from which node storage is requested
+     * @param capacity maximum number of nodes this layer can hold
+     * @param layerIndex the layer number (0 = base layer, higher = sparser)
+     * @throws IllegalArgumentException if {@code capacity} is not positive
+     */
     public HNSWLayer(
             final OffHeapAllocator allocator,
             final long capacity,
@@ -28,6 +51,17 @@ public final class HNSWLayer {
         this.nodeIndex  = new SparseEntityIndex(allocator, capacity);
     }
 
+    /**
+     * Restores a layer from memory-mapped storage produced by a previous run.
+     * Called by {@code VectorGraphRepository} during snapshot restore.
+     *
+     * @param nodeStorage the mapped segment containing serialised nodes
+     * @param nodeIndex the restored entity→offset index
+     * @param capacity the maximum node count this layer was built for
+     * @param layerIndex the layer number
+     * @param initialNodeCount the number of nodes already written at restore time
+     * @return the restored layer
+     */
     public static HNSWLayer fromMapped(
             final MemorySegment nodeStorage,
             final SparseEntityIndex nodeIndex,
@@ -50,7 +84,16 @@ public final class HNSWLayer {
         this.cursor = new AtomicLong(initialNodeCount);
     }
 
-    public long allocateNode(
+    /**
+     * Allocates and initialises a new node slot for {@code entityId}.
+     *
+     * @param entityId the entity this node represents
+     * @param vectorSrc the binary hypervector to store in the node
+     * @param nodeMaxLayer the highest layer this entity was assigned to
+     * @return the byte offset of the newly allocated node within {@code storage}
+     * @throws IllegalStateException if the layer is already at capacity
+     */
+     long allocateNode(
             final long entityId,
             final MemorySegment vectorSrc,
             final int nodeMaxLayer) {
@@ -69,11 +112,22 @@ public final class HNSWLayer {
         view.setNodeLayer(nodeMaxLayer);
         view.initNeighbors();
 
-        nodeIndex.put(SparseEntityIndex.xxHash3Stub(entityId), offset);
+        nodeIndex.put(SparseEntityIndex.mixHash64(entityId), offset);
         return offset;
     }
 
-    public long greedySearch(long entryOffset, final MemorySegment query) {
+    /**
+     * Greedily moves to the nearest neighbour of the current node until no
+     * improvement is found (local minimum).
+     *
+     * <p>Used during insertion to descend through upper layers quickly before
+     * the full beam search begins at the insertion layers.
+     *
+     * @param entryOffset byte offset of the starting node
+     * @param query the query hypervector
+     * @return the byte offset of the locally nearest node found
+     */
+     long greedySearch(long entryOffset, final MemorySegment query) {
         long currentOffset = entryOffset;
 
         while (true) {
@@ -95,13 +149,42 @@ public final class HNSWLayer {
             }
 
             if (bestOffset == currentOffset) {
-                return currentOffset; // local minimum
+                return currentOffset;
             }
             currentOffset = bestOffset;
         }
     }
 
-    public void efSearch(
+    /**
+     * Beam search (ef-Search) from {@code entryOffset}: explores the graph
+     * using a frontier of up to {@code ef} candidates and accumulates the best
+     * results in {@code results}.
+     *
+     * <p>Algorithm (from the original HNSW paper, Algorithm 2):
+     * <pre>
+     *   candidates <- {entry}        // min-heap ordered by distance to query
+     *   results <- {entry}        // top-k buffer (max-heap, bounded by ef)
+     *   visited <- {entry}
+     *
+     *   while candidates not empty:
+     *     c ← candidates.popMin()
+     *     if dist(c, query) &gt; results.worstDistance: break   // pruning condition
+     *     for each neighbour n of c:
+     *       if n not visited:
+     *         visited.add(n)
+     *         if dist(n, query) &lt; results.worstDistance or results not full:
+     *           candidates.push(n)
+     *           results.offer(n)
+     * </pre>
+     *
+     * @param entryOffset byte offset of the entry-point node
+     * @param query the query hypervector
+     * @param ef maximum frontier size (controls recall vs. speed tradeoff)
+     * @param results accumulator for the best candidates found; must be reset before call
+     * @param candidates pre-allocated frontier heap; must be reset before call
+     * @param visited pre-allocated visited tracker; must be reset before call
+     */
+     void efSearch(
             final long entryOffset,
             final MemorySegment query,
             final int ef,
@@ -133,28 +216,37 @@ public final class HNSWLayer {
                 final long nDist = viewAt(nOffset).getVectorDistance(query);
 
                 if (nDist < worstResult || !results.isFull()) {
-                    if (!candidates.isEmpty() && candidates.size() < ef) {
-                        candidates.push(nOffset, nDist);
-                    } else if (nDist < candidates.peekMinDistance() || candidates.size() < ef) {
-                        // Only push if we have room (bounded by ef)
-                        try { candidates.push(nOffset, nDist); }
-                        catch (IllegalStateException ignored) { /* candidates at capacity */ }
-                    }
                     results.offer(nOffset, nDist);
+                    if (candidates.size() < ef) {
+                        try {
+                            candidates.push(nOffset, nDist);
+                        } catch (IllegalStateException ignored) {
+
+                        }
+                    }
                 }
             }
         }
     }
 
-    public void connectNeighbors(
+    /**
+     * Wires {@code newNodeOffset} to its best neighbours from {@code candidates}
+     * and performs reciprocal back-linking. If a neighbour's list is already full,
+     * {@link #pruneNeighborList} selects the best {@code mMax} connections.
+     *
+     * @param newNodeOffset byte offset of the newly inserted node
+     * @param candidates the candidate set from {@link #efSearch}; will be sorted
+     * @param mMax maximum allowed neighbours per node at this layer
+     */
+     void connectNeighbors(
             final long newNodeOffset,
             final TopKBuffer candidates,
             final int mMax) {
 
         candidates.sortAscending(); // best (lowest dist) first
         final HNSWNodeView newNode = viewAt(newNodeOffset);
-
         final int toConnect = Math.min(candidates.size(), mMax);
+
         for (int i = 0; i < toConnect; i++) {
             final long neighborOffset = candidates.offsetAt(i);
             newNode.addNeighbor(neighborOffset);
@@ -167,7 +259,7 @@ public final class HNSWLayer {
     }
 
     public long findOffset(final long entityId) {
-        return nodeIndex.getOffset(SparseEntityIndex.xxHash3Stub(entityId));
+        return nodeIndex.getOffset(SparseEntityIndex.mixHash64(entityId));
     }
 
     public long nodeCount() {
@@ -178,18 +270,24 @@ public final class HNSWLayer {
         return nodeIndex;
     }
 
-    public MemorySegment rawStorage() {
-        return storage;
-    }
-
-    public int layerIndex() {
-        return layerIndex;
-    }
-
     HNSWNodeView viewAt(final long offset) {
         return new HNSWNodeView(storage.asSlice(offset, HNSWConfig.NODE_BYTES));
     }
 
+    /**
+     * Replaces {@code node}'s neighbour list with the best {@code mMax}
+     * connections from its current neighbours plus {@code candidateOffset}.
+     *
+     * <p>Collects all existing neighbours and the new candidate into a scratch
+     * array, sorts by distance to {@code node}'s vector, and writes the
+     * closest {@code mMax} back to the node. This is a simplified heuristic;
+     * the original paper's RNG pruning could be applied here for better
+     * graph diversity at the cost of additional complexity.
+     *
+     * @param node the node whose neighbour list is being pruned
+     * @param candidateOffset byte offset of the incoming candidate to consider
+     * @param mMax maximum number of neighbours to keep
+     */
     private void pruneNeighborList(
             final HNSWNodeView node,
             final long candidateOffset,
@@ -214,7 +312,7 @@ public final class HNSWLayer {
         scratchSize++;
 
         for (int i = 1; i < scratchSize; i++) {
-            final long keyOff  = scratchOffsets[i];
+            final long keyOff = scratchOffsets[i];
             final long keyDist = scratchDistances[i];
             int j = i - 1;
             while (j >= 0 && scratchDistances[j] > keyDist) {

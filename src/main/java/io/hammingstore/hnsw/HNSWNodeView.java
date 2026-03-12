@@ -1,15 +1,36 @@
 package io.hammingstore.hnsw;
 
 import io.hammingstore.math.VectorMath;
+import io.hammingstore.memory.BinaryVector;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
-public final class HNSWNodeView {
+/**
+ * A structured view over a single HNSW node stored in off-heap memory.
+ *
+ * <p>A node is a fixed-size record of exactly {@link HNSWConfig#NODE_BYTES} bytes,
+ * laid out as described in {@link HNSWConfig}. This class provides typed accessors
+ * that read and write directly into the underlying {@link MemorySegment} with no
+ * heap allocation - it is a zero-copy lens over the raw storage.
+ *
+ * <p>Instances are lightweight and short-lived. They are created on demand by
+ * {@link HNSWLayer#viewAt(long)} and discarded after each graph operation.
+ *
+ * <p>This class is package-private: it is an implementation detail of the
+ * {@code io.hammingstore.hnsw} package and must not be exposed to callers.
+ */
+final class HNSWNodeView {
 
     private final MemorySegment segment;
 
-    public HNSWNodeView(final MemorySegment segment) {
+    /**
+     * Wraps {@code segment} as a node view.
+     *
+     * @param segment the backing segment; must be exactly {@link HNSWConfig#NODE_BYTES} bytes
+     * @throws IllegalArgumentException if the segment has the wrong size
+     */
+     HNSWNodeView(final MemorySegment segment) {
         if (segment.byteSize() != HNSWConfig.NODE_BYTES) {
             throw new IllegalArgumentException(
                     "Segment must be exactly " + HNSWConfig.NODE_BYTES + " bytes, got: " + segment.byteSize());
@@ -17,51 +38,53 @@ public final class HNSWNodeView {
         this.segment = segment;
     }
 
-    public long getEntityId() {
+     long getEntityId() {
         return segment.get(ValueLayout.JAVA_LONG_UNALIGNED, HNSWConfig.NODE_OFFSET_ENTITY_ID);
     }
 
-    public void setEntityId(final long entityId) {
+    void setEntityId(final long entityId) {
         segment.set(ValueLayout.JAVA_LONG_UNALIGNED, HNSWConfig.NODE_OFFSET_ENTITY_ID, entityId);
     }
 
-    public MemorySegment getVectorSlice() {
-        return segment.asSlice(HNSWConfig.NODE_OFFSET_VECTOR, HNSWConfig.VECTOR_BYTES);
+     MemorySegment getVectorSlice() {
+        return segment.asSlice(HNSWConfig.NODE_OFFSET_VECTOR, BinaryVector.VECTOR_BYTES);
     }
 
-    public void setVector(final MemorySegment source) {
-        MemorySegment.copy(source, 0L, segment, HNSWConfig.NODE_OFFSET_VECTOR, HNSWConfig.VECTOR_BYTES);
+     void setVector(final MemorySegment source) {
+        MemorySegment.copy(source, 0L, segment, HNSWConfig.NODE_OFFSET_VECTOR, BinaryVector.VECTOR_BYTES);
     }
 
-    public int getNeighborCount() {
+     int getNeighborCount() {
         return segment.get(ValueLayout.JAVA_INT_UNALIGNED, HNSWConfig.NODE_OFFSET_NEIGHBOR_COUNT);
     }
 
-    public void setNeighborCount(final int count) {
+    void setNeighborCount(final int count) {
         segment.set(ValueLayout.JAVA_INT_UNALIGNED, HNSWConfig.NODE_OFFSET_NEIGHBOR_COUNT, count);
     }
 
-    public int getNodeLayer() {
-        return segment.get(ValueLayout.JAVA_INT_UNALIGNED, HNSWConfig.NODE_OFFSET_NODE_LAYER);
-    }
-
-    public void setNodeLayer(final int layer) {
+     void setNodeLayer(final int layer) {
         segment.set(ValueLayout.JAVA_INT_UNALIGNED, HNSWConfig.NODE_OFFSET_NODE_LAYER, layer);
     }
 
-    public long getNeighbor(final int index) {
+    /**
+     * Returns the byte offset of the neighbour at {@code index}, or
+     * {@link HNSWConfig#EMPTY_NEIGHBOR} if the slot is unused.
+     *
+     * @throws IndexOutOfBoundsException if {@code index} is out of {@code [0, M)}
+     */
+     long getNeighbor(final int index) {
         checkNeighborIndex(index);
         return segment.get(ValueLayout.JAVA_LONG_UNALIGNED,
                 HNSWConfig.NODE_OFFSET_NEIGHBORS_START + (long) index * Long.BYTES);
     }
 
-    public void setNeighbor(final int index, final long offset) {
-        checkNeighborIndex(index);
-        segment.set(ValueLayout.JAVA_LONG_UNALIGNED,
-                HNSWConfig.NODE_OFFSET_NEIGHBORS_START + (long) index * Long.BYTES, offset);
-    }
-
-    public boolean addNeighbor(final long offset) {
+    /**
+     * Appends {@code offset} to the neighbour list if space remains.
+     *
+     * @return {@code true} if the neighbour was added; {@code false} if the list
+     *         was already full (caller must then prune)
+     */
+     boolean addNeighbor(final long offset) {
         final int count = getNeighborCount();
         if (count >= HNSWConfig.M) {
             return false;
@@ -72,7 +95,13 @@ public final class HNSWNodeView {
         return true;
     }
 
-    public void initNeighbors() {
+    /**
+     * Resets the neighbour count to zero and fills all {@link HNSWConfig#M} slots
+     * with {@link HNSWConfig#EMPTY_NEIGHBOR}. Called immediately after a new node
+     * is allocated to ensure no stale data from a previous run is interpreted as
+     * a live neighbour.
+     */
+     void initNeighbors() {
         segment.set(ValueLayout.JAVA_INT_UNALIGNED, HNSWConfig.NODE_OFFSET_NEIGHBOR_COUNT, 0);
         for (int i = 0; i < HNSWConfig.M; i++) {
             segment.set(ValueLayout.JAVA_LONG_UNALIGNED,
@@ -81,12 +110,8 @@ public final class HNSWNodeView {
         }
     }
 
-    public long getVectorDistance(final MemorySegment query) {
+     long getVectorDistance(final MemorySegment query) {
         return VectorMath.hammingDistance(getVectorSlice(), query);
-    }
-
-    public MemorySegment rawSegment() {
-        return segment;
     }
 
     private static void checkNeighborIndex(final int index) {

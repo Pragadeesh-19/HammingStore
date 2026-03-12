@@ -15,7 +15,22 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
+/**
+ * gRPC service implementation for HammingStore.
+ *
+ * <p>Each RPC method follows the same pattern:
+ * <ol>
+ *   <li>Validate inputs; report {@code INVALID_ARGUMENT} on failure.</li>
+ *   <li>Delegate to {@link VectorGraphRepository} or {@link SymbolicReasoner}.</li>
+ *   <li>Map the result to a proto response and complete the observer.</li>
+ *   <li>Catch any unexpected exception and report {@code INTERNAL}.</li>
+ * </ol>
+ *
+ * <p>Thread safety is entirely delegated to {@link VectorGraphRepository}, which is
+ * internally guarded by a {@link java.util.concurrent.locks.StampedLock}.
+ */
 public final class HammingGrpcService extends HammingStoreGrpc.HammingStoreImplBase {
 
     private static final int VECTOR_BYTES = (int) BinaryVector.VECTOR_BYTES;
@@ -26,10 +41,8 @@ public final class HammingGrpcService extends HammingStoreGrpc.HammingStoreImplB
     public HammingGrpcService(
             final VectorGraphRepository repository,
             final SymbolicReasoner reasoner) {
-        if (repository == null) throw new NullPointerException("repository");
-        if (reasoner == null) throw new NullPointerException("reasoner");
-        this.repository = repository;
-        this.reasoner = reasoner;
+        this.repository = Objects.requireNonNull(repository, "repository");
+        this.reasoner   = Objects.requireNonNull(reasoner,   "reasoner");
     }
 
     @Override
@@ -46,6 +59,23 @@ public final class HammingGrpcService extends HammingStoreGrpc.HammingStoreImplB
             }
 
             respond(responseObserver, StoreBinaryResponse.newBuilder().setSuccess(true).build());
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(Status.INVALID_ARGUMENT
+                    .withDescription(e.getMessage()).asRuntimeException());
+        } catch (Exception e) {
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage()).asRuntimeException());
+        }
+    }
+
+    @Override
+    public void storeFloat(
+            final StoreFloatRequest request,
+            final StreamObserver<StoreFloatResponse> responseObserver) {
+        try {
+            final float[] embedding = bytesToFloats(request.getFloatVec());
+            repository.store(request.getEntityId(), embedding);
+            respond(responseObserver, StoreFloatResponse.newBuilder().setSuccess(true).build());
         } catch (IllegalArgumentException e) {
             responseObserver.onError(Status.INVALID_ARGUMENT
                     .withDescription(e.getMessage()).asRuntimeException());
@@ -197,30 +227,13 @@ public final class HammingGrpcService extends HammingStoreGrpc.HammingStoreImplB
     }
 
     @Override
-    public void storeFloat(
-            final StoreFloatRequest request,
-            final StreamObserver<StoreFloatResponse> responseObserver) {
-        try {
-            final float[] embedding = bytesToFloats(request.getFloatVec());
-            repository.store(request.getEntityId(), embedding);
-            respond(responseObserver, StoreFloatResponse.newBuilder().setSuccess(true).build());
-        } catch (IllegalArgumentException e) {
-            responseObserver.onError(Status.INVALID_ARGUMENT
-                    .withDescription(e.getMessage()).asRuntimeException());
-        } catch (Exception e) {
-            responseObserver.onError(Status.INTERNAL
-                    .withDescription(e.getMessage()).asRuntimeException());
-        }
-    }
-
-    @Override
     public void searchFloat(
             final SearchFloatRequest request,
             final StreamObserver<SearchFloatResponse> responseObserver) {
         try {
             final float[] embedding = bytesToFloats(request.getFloatVec());
             final HNSWIndex.SearchResults results =
-                    repository.searchHNSWBruteForce(embedding, request.getK());
+                    repository.searchHNSW(embedding, request.getK());
             respond(responseObserver, SearchFloatResponse.newBuilder()
                     .addAllResults(toProto(results)).build());
         } catch (IllegalArgumentException e) {
@@ -251,6 +264,9 @@ public final class HammingGrpcService extends HammingStoreGrpc.HammingStoreImplB
         }
     }
 
+    /**
+     * Converts {@link HNSWIndex.SearchResults} to a list of proto {@link SearchResult} messages.
+     */
     private static List<SearchResult> toProto(final HNSWIndex.SearchResults results) {
         final List<SearchResult> list = new ArrayList<>(results.count());
         for (int i = 0; i < results.count(); i++) {
@@ -263,6 +279,11 @@ public final class HammingGrpcService extends HammingStoreGrpc.HammingStoreImplB
         return list;
     }
 
+    /**
+     * Asserts that {@code bytes} is exactly {@link #VECTOR_BYTES} bytes long.
+     *
+     * @throws IllegalArgumentException if the size does not match
+     */
     private static void validateVectorBytes(final ByteString bytes, final String field) {
         if (bytes.size() != VECTOR_BYTES) {
             throw new IllegalArgumentException(
@@ -270,17 +291,27 @@ public final class HammingGrpcService extends HammingStoreGrpc.HammingStoreImplB
         }
     }
 
+    /**
+     * Copies the bytes of {@code src} into {@code dest} starting at offset 0.
+     * Allocates one intermediate {@code byte[]} via {@link ByteString#toByteArray()}.
+     */
     private static void copyBytesInto(final ByteString src, final MemorySegment dest) {
         final byte[] tmp = src.toByteArray();
         MemorySegment.copy(MemorySegment.ofArray(tmp), 0L, dest, 0L, tmp.length);
     }
 
+    /** Completes a unary RPC by sending {@code response} and calling {@code onCompleted}. */
     private static <T> void respond(
             final StreamObserver<T> observer, final T response) {
         observer.onNext(response);
         observer.onCompleted();
     }
 
+    /**
+     * Decodes {@code bytes} as a little-endian IEEE-754 float array.
+     *
+     * @throws IllegalArgumentException if {@code bytes.size()} is not divisible by 4
+     */
     private static float[] bytesToFloats(final ByteString bytes) {
         final byte[] raw = bytes.toByteArray();
         if (raw.length % Float.BYTES != 0) {
