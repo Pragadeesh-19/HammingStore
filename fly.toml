@@ -22,20 +22,6 @@ primary_region = 'lhr'
 
 [[services]]
   protocol = 'tcp'
-  internal_port = 50051
-
-  [[services.ports]]
-    port = 50051
-    handlers = ['tls', 'http']
-    tls_options = { alpn = ['h2'] }
-
-  [services.concurrency]
-    type = 'requests'
-    hard_limit = 100
-    soft_limit = 50
-
-[[services]]
-  protocol = 'tcp'
   internal_port = 8080
 
   [[services.ports]]
@@ -45,6 +31,8 @@ primary_region = 'lhr'
   [[services.ports]]
     port = 8080
     handlers = ['tls', 'http']
+    [services.ports.tls.options]
+      alpn = ['http/1.1', 'h2']
 
   [services.concurrency]
     type = 'connections'
