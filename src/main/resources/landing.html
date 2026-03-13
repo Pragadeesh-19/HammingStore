@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HammingStore — Vector Database</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg:      #080808;
+            --bg2:     #0f0f0f;
+            --bg3:     #141414;
+            --border:  #1e1e1e;
+            --amber:   #f59e0b;
+            --amber2:  #fbbf24;
+            --dim:     #555;
+            --mid:     #888;
+            --text:    #d4d4d4;
+            --white:   #f0f0f0;
+            --red:     #ef4444;
+            --green:   #22c55e;
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html { scroll-behavior: smooth; }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            line-height: 1.7;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* ── SCANLINE OVERLAY ─────────────────────────────────────── */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background: repeating-linear-gradient(
+                    0deg,
+                    transparent,
+                    transparent 2px,
+                    rgba(0,0,0,0.04) 2px,
+                    rgba(0,0,0,0.04) 4px
+            );
+            pointer-events: none;
+            z-index: 9999;
+        }
+
+        /* ── LAYOUT ───────────────────────────────────────────────── */
+        .wrap { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+
+        /* ── HEADER ───────────────────────────────────────────────── */
+        header {
+            border-bottom: 1px solid var(--border);
+            padding: 18px 0;
+            position: sticky;
+            top: 0;
+            background: rgba(8,8,8,0.95);
+            backdrop-filter: blur(8px);
+            z-index: 100;
+        }
+
+        header .wrap {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .logo {
+            font-family: 'Space Mono', monospace;
+            font-weight: 700;
+            font-size: 15px;
+            color: var(--white);
+            letter-spacing: 0.05em;
+        }
+
+        .logo span { color: var(--amber); }
+
+        nav { display: flex; gap: 24px; }
+
+        nav a {
+            color: var(--dim);
+            text-decoration: none;
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            transition: color 0.15s;
+        }
+
+        nav a:hover { color: var(--amber); }
+
+        /* ── HERO ─────────────────────────────────────────────────── */
+        .hero {
+            padding: 80px 0 60px;
+            border-bottom: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .hero::after {
+            content: '';
+            position: absolute;
+            right: -100px;
+            top: -100px;
+            width: 400px;
+            height: 400px;
+            background: radial-gradient(circle, rgba(245,158,11,0.04) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .tag {
+            display: inline-block;
+            font-size: 11px;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--amber);
+            border: 1px solid rgba(245,158,11,0.3);
+            padding: 3px 10px;
+            margin-bottom: 28px;
+        }
+
+        h1 {
+            font-family: 'Space Mono', monospace;
+            font-size: clamp(28px, 5vw, 48px);
+            font-weight: 700;
+            color: var(--white);
+            line-height: 1.15;
+            letter-spacing: -0.02em;
+            margin-bottom: 20px;
+        }
+
+        h1 em {
+            font-style: normal;
+            color: var(--amber);
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: var(--mid);
+            max-width: 560px;
+            line-height: 1.8;
+            margin-bottom: 40px;
+        }
+
+        .cta-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+
+        .btn {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            padding: 10px 22px;
+            border: 1px solid;
+            cursor: pointer;
+            text-decoration: none;
+            transition: all 0.15s;
+            display: inline-block;
+        }
+
+        .btn-primary {
+            background: var(--amber);
+            color: #000;
+            border-color: var(--amber);
+            font-weight: 700;
+        }
+
+        .btn-primary:hover { background: var(--amber2); border-color: var(--amber2); }
+
+        .btn-ghost {
+            background: transparent;
+            color: var(--mid);
+            border-color: var(--border);
+        }
+
+        .btn-ghost:hover { color: var(--white); border-color: var(--dim); }
+
+        /* ── STATS STRIP ──────────────────────────────────────────── */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .stat {
+            padding: 32px 24px;
+            border-right: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat:last-child { border-right: none; }
+
+        .stat::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+            background: var(--amber);
+            transform: scaleX(0);
+            transform-origin: left;
+            transition: transform 0.4s ease;
+        }
+
+        .stat:hover::before { transform: scaleX(1); }
+
+        .stat-val {
+            font-family: 'Space Mono', monospace;
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--white);
+            line-height: 1;
+            margin-bottom: 8px;
+        }
+
+        .stat-val span { color: var(--amber); font-size: 20px; }
+
+        .stat-label {
+            font-size: 11px;
+            color: var(--dim);
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+
+        /* ── SECTION ──────────────────────────────────────────────── */
+        section { padding: 64px 0; border-bottom: 1px solid var(--border); }
+
+        .section-head {
+            display: flex;
+            align-items: baseline;
+            gap: 16px;
+            margin-bottom: 40px;
+        }
+
+        .section-head h2 {
+            font-family: 'Space Mono', monospace;
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--white);
+            letter-spacing: -0.01em;
+        }
+
+        .section-head .line {
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+
+        .section-num {
+            font-size: 11px;
+            color: var(--amber);
+            letter-spacing: 0.1em;
+        }
+
+        /* ── BENCHMARK TABLE ──────────────────────────────────────── */
+        .bench-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+
+        .bench-table th {
+            text-align: left;
+            font-size: 11px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--dim);
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--border);
+            font-weight: 400;
+        }
+
+        .bench-table td {
+            padding: 14px 16px;
+            border-bottom: 1px solid rgba(30,30,30,0.6);
+            color: var(--text);
+            vertical-align: middle;
+        }
+
+        .bench-table tr:hover td { background: var(--bg2); }
+
+        .bench-table .metric { color: var(--mid); font-size: 12px; }
+
+        .bench-table .val {
+            font-family: 'Space Mono', monospace;
+            color: var(--amber);
+            font-size: 15px;
+            font-weight: 700;
+        }
+
+        .bench-table .baseline {
+            color: var(--dim);
+            font-size: 12px;
+        }
+
+        .bar-wrap {
+            width: 140px;
+            height: 4px;
+            background: var(--border);
+            position: relative;
+        }
+
+        .bar-fill {
+            height: 100%;
+            background: var(--amber);
+            transition: width 1s ease;
+        }
+
+        /* ── CODE BLOCK ───────────────────────────────────────────── */
+        .code-block {
+            background: var(--bg2);
+            border: 1px solid var(--border);
+            padding: 24px;
+            overflow-x: auto;
+            position: relative;
+        }
+
+        .code-block .file-tag {
+            position: absolute;
+            top: 0; right: 0;
+            font-size: 10px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--dim);
+            background: var(--bg3);
+            border-left: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+            padding: 4px 10px;
+        }
+
+        pre {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12.5px;
+            line-height: 1.8;
+            white-space: pre;
+            color: var(--text);
+        }
+
+        .c-comment { color: #4a5568; }
+        .c-kw      { color: #93c5fd; }
+        .c-str     { color: #86efac; }
+        .c-num     { color: var(--amber); }
+        .c-fn      { color: #c4b5fd; }
+        .c-var     { color: var(--text); }
+
+        /* ── API GRID ─────────────────────────────────────────────── */
+        .api-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1px;
+            background: var(--border);
+            border: 1px solid var(--border);
+        }
+
+        .api-item {
+            background: var(--bg);
+            padding: 20px 24px;
+            transition: background 0.15s;
+        }
+
+        .api-item:hover { background: var(--bg2); }
+
+        .api-rpc {
+            font-family: 'Space Mono', monospace;
+            font-size: 13px;
+            color: var(--amber);
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .api-desc { font-size: 12px; color: var(--mid); line-height: 1.6; }
+
+        /* ── FOOTER ───────────────────────────────────────────────── */
+        footer {
+            padding: 32px 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        footer .logo { font-size: 13px; }
+
+        .footer-links { display: flex; gap: 20px; }
+
+        .footer-links a {
+            font-size: 11px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--dim);
+            text-decoration: none;
+            transition: color 0.15s;
+        }
+
+        .footer-links a:hover { color: var(--amber); }
+
+        .status-dot {
+            display: inline-block;
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: var(--green);
+            margin-right: 6px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50%       { opacity: 0.4; }
+        }
+
+        /* ── RESPONSIVE ───────────────────────────────────────────── */
+        @media (max-width: 640px) {
+            .stats { grid-template-columns: 1fr 1fr; }
+            .stat { border-right: none; border-bottom: 1px solid var(--border); }
+            .api-grid { grid-template-columns: 1fr; }
+            nav { display: none; }
+            .stat-val { font-size: 24px; }
+        }
+
+        /* ── FADE IN ──────────────────────────────────────────────── */
+        .fade-in {
+            opacity: 0;
+            transform: translateY(12px);
+            animation: fadeUp 0.5s ease forwards;
+        }
+
+        @keyframes fadeUp {
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .fade-in:nth-child(1) { animation-delay: 0.05s; }
+        .fade-in:nth-child(2) { animation-delay: 0.12s; }
+        .fade-in:nth-child(3) { animation-delay: 0.19s; }
+        .fade-in:nth-child(4) { animation-delay: 0.26s; }
+    </style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+    <div class="wrap">
+        <div class="logo">Hamming<span>Store</span></div>
+        <nav>
+            <a href="#benchmark">Benchmark</a>
+            <a href="#quickstart">Quick Start</a>
+            <a href="#api">API</a>
+            <a href="https://github.com/Pragadeesh-19/HammingStore" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<!-- HERO -->
+<section class="hero">
+    <div class="wrap">
+        <div class="tag fade-in">Vector Database · VSA Engine · gRPC</div>
+        <h1 class="fade-in">Binary hypervectors.<br><em>32× smaller.</em><br>Multi-hop in 3.7ms.</h1>
+        <p class="subtitle fade-in">
+            HammingStore stores embeddings as 10,048-bit binary vectors via random projection.
+            Typed relations, analogical inference, and chain traversal —
+            operations no other vector database ships.
+        </p>
+        <div class="cta-row fade-in">
+            <a href="#quickstart" class="btn btn-primary">Get Started</a>
+            <a href="https://github.com/Pragadeesh-19/HammingStore" target="_blank" class="btn btn-ghost">View Source</a>
+            <span style="color:var(--dim);font-size:12px;">
+        <span class="status-dot"></span>Live · London
+      </span>
+        </div>
+    </div>
+</section>
+
+<!-- STATS -->
+<div class="stats">
+    <div class="stat">
+        <div class="stat-val">32<span>×</span></div>
+        <div class="stat-label">Memory compression</div>
+    </div>
+    <div class="stat">
+        <div class="stat-val">3.7<span>ms</span></div>
+        <div class="stat-label">2-hop chain P50</div>
+    </div>
+    <div class="stat">
+        <div class="stat-val">4.6<span>ms</span></div>
+        <div class="stat-label">3-hop chain P50</div>
+    </div>
+    <div class="stat">
+        <div class="stat-val">18<span>MB</span></div>
+        <div class="stat-label">14,541 entities</div>
+    </div>
+</div>
+
+<!-- BENCHMARK -->
+<section id="benchmark">
+    <div class="wrap">
+        <div class="section-head">
+            <span class="section-num">01</span>
+            <h2>Benchmark — FB15k-237</h2>
+            <div class="line"></div>
+        </div>
+
+        <table class="bench-table">
+            <thead>
+            <tr>
+                <th>Metric</th>
+                <th>HammingStore</th>
+                <th>Float32 baseline</th>
+                <th></th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+                <td class="metric">Memory · 14,541 entities</td>
+                <td class="val">18.3 MB</td>
+                <td class="baseline">584.4 MB</td>
+                <td>
+                    <div class="bar-wrap"><div class="bar-fill" style="width:3%"></div></div>
+                </td>
+            </tr>
+            <tr>
+                <td class="metric">Search latency · P50</td>
+                <td class="val">11 ms</td>
+                <td class="baseline">gRPC overhead</td>
+                <td><div class="bar-wrap"><div class="bar-fill" style="width:55%"></div></div></td>
+            </tr>
+            <tr>
+                <td class="metric">2-hop chain traversal · P50</td>
+                <td class="val">3.7 ms</td>
+                <td class="baseline">not supported</td>
+                <td><div class="bar-wrap"><div class="bar-fill" style="width:80%"></div></div></td>
+            </tr>
+            <tr>
+                <td class="metric">3-hop chain traversal · P50</td>
+                <td class="val">4.6 ms</td>
+                <td class="baseline">not supported</td>
+                <td><div class="bar-wrap"><div class="bar-fill" style="width:75%"></div></div></td>
+            </tr>
+            </tbody>
+        </table>
+
+        <p style="color:var(--dim);font-size:11px;margin-top:16px;letter-spacing:0.05em;">
+            Encoder: MiniLM-L6-v2 · 384 dims · 310,116 triples · London region · March 2026
+        </p>
+    </div>
+</section>
+
+<!-- QUICK START -->
+<section id="quickstart">
+    <div class="wrap">
+        <div class="section-head">
+            <span class="section-num">02</span>
+            <h2>Quick Start</h2>
+            <div class="line"></div>
+        </div>
+
+        <div class="code-block" style="margin-bottom:16px;">
+            <div class="file-tag">terminal</div>
+            <pre><span class="c-comment"># Install gRPC tools</span>
+<span class="c-var">pip install grpcio grpcio-tools numpy</span>
+
+<span class="c-comment"># Clone and generate stubs</span>
+<span class="c-var">git clone https://github.com/Pragadeesh-19/HammingStore</span>
+<span class="c-var">cd HammingStore</span>
+<span class="c-var">python -m grpc_tools.protoc \
+  -I src/main/protobuf \
+  --python_out=. \
+  --grpc_python_out=. \
+  src/main/protobuf/hammingstore.proto</span></pre>
+        </div>
+
+        <div class="code-block">
+            <div class="file-tag">client.py</div>
+            <pre><span class="c-kw">import</span> <span class="c-var">grpc</span>, <span class="c-var">numpy</span> <span class="c-kw">as</span> <span class="c-var">np</span>
+<span class="c-kw">import</span> <span class="c-var">hammingstore_pb2</span> <span class="c-kw">as</span> <span class="c-var">pb</span>
+<span class="c-kw">import</span> <span class="c-var">hammingstore_pb2_grpc</span> <span class="c-kw">as</span> <span class="c-var">pb_grpc</span>
+
+<span class="c-comment"># Connect to the live instance</span>
+<span class="c-var">channel</span> = <span class="c-fn">grpc.secure_channel</span>(
+    <span class="c-str">"hammingstore.fly.dev:443"</span>,
+    <span class="c-fn">grpc.ssl_channel_credentials</span>()
+)
+<span class="c-var">client</span> = <span class="c-fn">pb_grpc.HammingStoreStub</span>(<span class="c-var">channel</span>)
+
+<span class="c-comment"># Store a float embedding (server binarises it)</span>
+<span class="c-var">embedding</span> = <span class="c-var">np</span>.<span class="c-fn">random.randn</span>(<span class="c-num">384</span>).<span class="c-fn">astype</span>(<span class="c-var">np</span>.<span class="c-var">float32</span>)
+<span class="c-var">client</span>.<span class="c-fn">StoreFloat</span>(<span class="c-var">pb</span>.<span class="c-fn">StoreFloatRequest</span>(
+    <span class="c-var">entity_id</span>=<span class="c-num">1</span>,
+    <span class="c-var">float_vec</span>=<span class="c-var">embedding</span>.<span class="c-fn">tobytes</span>()
+))
+
+<span class="c-comment"># Multi-hop chain traversal</span>
+<span class="c-var">results</span> = <span class="c-var">client</span>.<span class="c-fn">QueryChain</span>(<span class="c-var">pb</span>.<span class="c-fn">QueryChainRequest</span>(
+    <span class="c-var">start_entity_id</span>=<span class="c-num">1</span>,
+    <span class="c-var">relation_ids</span>=[<span class="c-num">101</span>, <span class="c-num">202</span>],
+    <span class="c-var">k</span>=<span class="c-num">10</span>
+))</pre>
+        </div>
+    </div>
+</section>
+
+<!-- API -->
+<section id="api">
+    <div class="wrap">
+        <div class="section-head">
+            <span class="section-num">03</span>
+            <h2>gRPC API</h2>
+            <div class="line"></div>
+        </div>
+
+        <div class="api-grid">
+            <div class="api-item">
+                <div class="api-rpc">StoreFloat</div>
+                <div class="api-desc">Binarise and store a float embedding via random projection</div>
+            </div>
+            <div class="api-item">
+                <div class="api-rpc">StoreBinary</div>
+                <div class="api-desc">Store a pre-binarised 10,048-bit hypervector directly</div>
+            </div>
+            <div class="api-item">
+                <div class="api-rpc">StoreTypedEdge</div>
+                <div class="api-desc">Store a role-encoded typed relation between entities</div>
+            </div>
+            <div class="api-item">
+                <div class="api-rpc">SearchFloat</div>
+                <div class="api-desc">Approximate nearest-neighbour search via HNSW</div>
+            </div>
+            <div class="api-item">
+                <div class="api-rpc">QueryHop</div>
+                <div class="api-desc">Single typed-edge traversal: given (subject, relation) → objects</div>
+            </div>
+            <div class="api-item">
+                <div class="api-rpc">QueryChain</div>
+                <div class="api-desc">Multi-hop chain traversal across N relation types</div>
+            </div>
+            <div class="api-item">
+                <div class="api-rpc">QueryAnalogy</div>
+                <div class="api-desc">A:B :: C:? via XOR binding in hypervector space</div>
+            </div>
+            <div class="api-item">
+                <div class="api-rpc">Retract</div>
+                <div class="api-desc">Tombstone an entity, preventing further writes</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+    <div class="wrap" style="width:100%;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+        <div class="logo">Hamming<span>Store</span> <span style="color:var(--dim);font-weight:300;font-size:11px;">/ Apache 2.0</span></div>
+        <div class="footer-links">
+            <a href="https://github.com/Pragadeesh-19/HammingStore" target="_blank">GitHub</a>
+            <a href="https://github.com/Pragadeesh-19/HammingStore/blob/main/src/main/protobuf/hammingstore.proto" target="_blank">Proto</a>
+            <a href="https://github.com/Pragadeesh-19/HammingStore/blob/main/benchmark/SETUP.md" target="_blank">Benchmark</a>
+        </div>
+    </div>
+</footer>
+
+</body>
+</html>

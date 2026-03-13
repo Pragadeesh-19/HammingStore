@@ -34,6 +34,23 @@ primary_region = 'lhr'
     hard_limit = 100
     soft_limit = 50
 
+[[services]]
+  protocol = 'tcp'
+  internal_port = 8080
+
+  [[services.ports]]
+    port = 80
+    handlers = ['http']
+
+  [[services.ports]]
+    port = 8080
+    handlers = ['tls', 'http']
+
+  [services.concurrency]
+    type = 'connections'
+    soft_limit = 100
+    hard_limit = 200
+
 [[vm]]
   memory = '1gb'
   cpus = 1

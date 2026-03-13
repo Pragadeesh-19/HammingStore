@@ -1,5 +1,6 @@
 package io.hammingstore.grpc;
 
+import com.sun.net.httpserver.HttpServer;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.hammingstore.graph.VectorGraphRepository;
@@ -7,7 +8,12 @@ import io.hammingstore.vsa.ProjectionConfig;
 import io.hammingstore.vsa.SymbolicReasoner;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
@@ -30,8 +36,11 @@ public final class HammingServer {
 
     private static final Logger LOG = Logger.getLogger(HammingServer.class.getName());
 
+    private static final int HTTP_PORT = 8080;
+
     private final Server server;
     private final VectorGraphRepository repository;
+    private final HttpServer httpServer;
 
     /**
      * Starts the gRPC server on {@code port} backed by {@code repository}.
@@ -52,6 +61,24 @@ public final class HammingServer {
                 .addService(service)
                 .build()
                 .start();
+
+        this.httpServer = HttpServer.create(new InetSocketAddress("0.0.0.0", HTTP_PORT), 0);
+        this.httpServer.createContext("/", exchange -> {
+            try {
+                final byte[] body = loadLandingPage();
+                exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+                exchange.getResponseHeaders().set("Cache-Control", "public, max-age=3600");
+                exchange.sendResponseHeaders(200, body.length);
+                try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+            } catch (Exception e) {
+                exchange.sendResponseHeaders(500, 0);
+                exchange.getResponseBody().close();
+            }
+        });
+        this.httpServer.setExecutor(Executors.newFixedThreadPool(2));
+        this.httpServer.start();
+
+        LOG.info("HTTP landing page listening on port " + HTTP_PORT);
 
         LOG.info("HammingStore started"
                 + " | port="       + port
@@ -83,6 +110,15 @@ public final class HammingServer {
     public void stop() throws InterruptedException {
         server.shutdown().awaitTermination(30, TimeUnit.SECONDS);
         repository.close();
+    }
+
+    private static byte[] loadLandingPage() throws IOException {
+        try (InputStream is = HammingServer.class
+                .getClassLoader()
+                .getResourceAsStream("landing.html")){
+            if (is == null) return "<h1>HammingStore</h1>".getBytes(StandardCharsets.UTF_8);
+            return is.readAllBytes();
+        }
     }
 
     /**
