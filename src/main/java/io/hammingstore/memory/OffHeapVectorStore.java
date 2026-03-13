@@ -125,14 +125,6 @@ public final class OffHeapVectorStore {
         return cursor.get();
     }
 
-    /**
-     * @return the raw backing segment for bulk operations such as hamming distance
-     * scans. Callers must treat this as read-only outside of the store's own methods.
-     */
-    public MemorySegment rawStorage() {
-        return storage;
-    }
-
     private void validateOffset(final long byteOffset) {
         if (byteOffset < 0 || byteOffset + SLOT_BYTES > storage.byteSize()) {
             throw new IllegalArgumentException(

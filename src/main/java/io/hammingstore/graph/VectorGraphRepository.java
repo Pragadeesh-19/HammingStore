@@ -49,14 +49,6 @@ import java.util.concurrent.locks.StampedLock;
  */
 public final class VectorGraphRepository implements AutoCloseable{
 
-    public record SearchResult(long entityOffset, long hammingDistance, double similarity)
-            implements Comparable<SearchResult> {
-        @Override
-        public int compareTo(final SearchResult o) {
-            return Long.compare(this.hammingDistance, o.hammingDistance);
-        }
-    }
-
     /**
      * Byte size of one vector slot in the flat store.
      * Alias for {@link BinaryVector#VECTOR_BYTES} kept private to reduce noise
@@ -64,9 +56,16 @@ public final class VectorGraphRepository implements AutoCloseable{
      */
     private static final long SLOT_BYTES = BinaryVector.VECTOR_BYTES;
 
+    private static final int SUBJECT_SHIFT = 1;
+    private static final int RELATION_SHIFT = 2;
+    private static final int OBJECT_SHIFT   = 3;
+
     private final OffHeapVectorStore vectorStore;
     private final SparseEntityIndex entityIndex;
     private final MemorySegment bindScratch;
+    private final MemorySegment bindScratch2;
+    private final MemorySegment bindScratch3;
+    private final MemorySegment bindScratch4;
     private final HNSWIndex hnswIndex;
     private final RandomProjectionEncoder encoder;
     private final StampedLock lock = new StampedLock();
@@ -90,12 +89,19 @@ public final class VectorGraphRepository implements AutoCloseable{
         this.vectorStore = new OffHeapVectorStore(allocator, maxVectors);
         this.entityIndex = new SparseEntityIndex(allocator, maxVectors);
         this.bindScratch = allocator.allocateRawSegment(SLOT_BYTES, Long.BYTES);
+        this.bindScratch2 = allocator.allocateRawSegment(SLOT_BYTES, Long.BYTES);
+        this.bindScratch3 = allocator.allocateRawSegment(SLOT_BYTES, Long.BYTES);
+        this.bindScratch4 = allocator.allocateRawSegment(SLOT_BYTES, Long.BYTES);
         this.encoder = new RandomProjectionEncoder(allocator, projectionConfig);
         this.hnswIndex = new HNSWIndex(maxVectors);
         this.mappedAllocator = null;
         this.dataDir = null;
         this.encodeScratch = ThreadLocal.withInitial(() ->
                 allocator.allocateRawSegment(SLOT_BYTES, Long.BYTES));
+    }
+
+    public VectorGraphRepository(final long maxVectors) {
+        this(maxVectors, ProjectionConfig.of(ProjectionConfig.DIMS_MINILM));
     }
 
     /**
@@ -200,11 +206,14 @@ public final class VectorGraphRepository implements AutoCloseable{
         final RandomProjectionEncoder encoder = new RandomProjectionEncoder(
                 new OffHeapAllocator(encoderSlots), projectionConfig);
 
-        final MemorySegment bindScratch = new OffHeapAllocator(4L)
-                .allocateRawSegment(SLOT_BYTES, Long.BYTES);
+        final OffHeapAllocator scratchAlloc = new OffHeapAllocator(5L);
+        final MemorySegment bindScratch  = scratchAlloc.allocateRawSegment(SLOT_BYTES, Long.BYTES);
+        final MemorySegment bindScratch2 = scratchAlloc.allocateRawSegment(SLOT_BYTES, Long.BYTES);
+        final MemorySegment bindScratch3 = scratchAlloc.allocateRawSegment(SLOT_BYTES, Long.BYTES);
+        final MemorySegment bindScratch4 = scratchAlloc.allocateRawSegment(SLOT_BYTES, Long.BYTES);
 
         return new VectorGraphRepository(
-                vectorStore, entityIndex, hnswIndex, encoder, bindScratch, mfa, dataDir);
+                vectorStore, entityIndex, hnswIndex, encoder, bindScratch, bindScratch2, bindScratch3, bindScratch4, mfa, dataDir);
     }
 
     private VectorGraphRepository(
@@ -213,6 +222,9 @@ public final class VectorGraphRepository implements AutoCloseable{
             final HNSWIndex hnswIndex,
             final RandomProjectionEncoder encoder,
             final MemorySegment bindScratch,
+            final MemorySegment bindScratch2,
+            final MemorySegment bindScratch3,
+            final MemorySegment bindScratch4,
             final MappedFileAllocator mappedAllocator,
             final Path dataDir) {
         this.vectorStore = vectorStore;
@@ -220,6 +232,9 @@ public final class VectorGraphRepository implements AutoCloseable{
         this.hnswIndex = hnswIndex;
         this.encoder = encoder;
         this.bindScratch = bindScratch;
+        this.bindScratch2 = bindScratch2;
+        this.bindScratch3 = bindScratch3;
+        this.bindScratch4 = bindScratch4;
         this.mappedAllocator  = mappedAllocator;
         this.dataDir = dataDir;
         this.encodeScratch = ThreadLocal.withInitial(() -> {
@@ -290,6 +305,57 @@ public final class VectorGraphRepository implements AutoCloseable{
             vectorStore.copyInto(edgeSlot, bindScratch);
 
             final long compositeId = subjectId ^ relationshipId ^ objectId;
+            entityIndex.put(SparseEntityIndex.mixHash64(compositeId), edgeSlot);
+            hnswIndex.insertBinary(compositeId, bindScratch);
+        } finally {
+            lock.unlockWrite(stamp);
+        }
+    }
+
+    /**
+     * Stores a role-encoded typed edge: {@code subject -[relation]-> object}.
+     *
+     * <p>Unlike {@link #bindRelationalEdge}, which uses flat XOR binding,
+     * this method applies a distinct cyclic bit permutation to each role:
+     * <pre>
+     *     edge = bind(permute(subject,  SUBJECT_SHIFT),
+     *             bind(permute(relation, RELATION_SHIFT),
+     *                  permute(object,   OBJECT_SHIFT)))
+     * </pre>
+     * This eliminates cross relation interferences when multiple relation types
+     * share the same vector space.
+     *
+     * <p>Edges stored here must be queried via
+     * {@link io.hammingstore.vsa.SymbolicReasoner#queryTypedRelation} or
+     * {@link io.hammingstore.vsa.SymbolicReasoner#queryChain}, not via the
+     * untyped {@code queryRelation} or {@code queryAnalogy}.
+     *
+     * @param subjectId entity ID of the subject; must be already be stored.
+     * @param relationId entityId of the relation type; must be already stored.
+     * @param objectId entityID of the object. must be already stored.
+     * @throws IllegalArgumentException if any of the three entity IDs is not found.
+     */
+    public void storeTypedEdge(
+            final long subjectId,
+            final long relationId,
+            final long objectId) {
+        final long stamp = lock.writeLock();
+        try {
+            final MemorySegment sv = resolveVector(subjectId,  "subject");
+            final MemorySegment rv = resolveVector(relationId, "relation");
+            final MemorySegment ov = resolveVector(objectId,   "object");
+
+            VectorMath.permuteN(sv, SUBJECT_SHIFT,  bindScratch,  bindScratch4);
+            VectorMath.permuteN(rv, RELATION_SHIFT, bindScratch2, bindScratch4);
+            VectorMath.permuteN(ov, OBJECT_SHIFT,   bindScratch3, bindScratch4);
+
+            VectorMath.bind(bindScratch2, bindScratch3, bindScratch2);
+            VectorMath.bind(bindScratch,  bindScratch2, bindScratch);
+
+            final long edgeSlot    = vectorStore.allocateSlot();
+            vectorStore.copyInto(edgeSlot, bindScratch);
+
+            final long compositeId = subjectId ^ relationId ^ objectId;
             entityIndex.put(SparseEntityIndex.mixHash64(compositeId), edgeSlot);
             hnswIndex.insertBinary(compositeId, bindScratch);
         } finally {
@@ -378,7 +444,7 @@ public final class VectorGraphRepository implements AutoCloseable{
      * nearest stored vectors.
      *
      * @param queryEmbedding the float query embedding
-     * @param k              number of nearest neighbours to return
+     * @param k number of nearest neighbours to return
      * @return search results sorted by ascending Hamming distance
      */
     public HNSWIndex.SearchResults searchHNSW(final float[] queryEmbedding, final int k) {
@@ -393,7 +459,7 @@ public final class VectorGraphRepository implements AutoCloseable{
      *
      * @param binaryQuery the binary query hypervector;
      *                    must be exactly {@link BinaryVector#VECTOR_BYTES} bytes
-     * @param k           number of nearest neighbours to return
+     * @param k number of nearest neighbours to return
      * @return search results sorted by ascending Hamming distance
      */
     public HNSWIndex.SearchResults searchHNSWBinary(final MemorySegment binaryQuery, final int k) {
@@ -411,8 +477,6 @@ public final class VectorGraphRepository implements AutoCloseable{
     public long nodeCount() {
         return hnswIndex.layer(0).nodeCount();
     }
-
-    public HNSWIndex hnswIndex() { return hnswIndex; }
 
     public OffHeapVectorStore vectorStore() { return vectorStore; }
 

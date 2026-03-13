@@ -248,32 +248,37 @@ public final class HNSWIndex implements AutoCloseable {
         final int  currentTopLayer = topLayer.get();
         long entryOffset = currentEntryOffset;
 
-        if (entryOffset != -1L) {
-            for (int l = currentTopLayer; l > nodeMaxLayer; l--) {
-                entryOffset = layers[l].greedySearch(entryOffset, binaryVec);
-                final long lower = projectOffsetToLayer(layers[l], entryOffset, l - 1);
-                if (lower >= 0) {
-                    entryOffset = lower;
-                } else {
-                    final long fallback = layers[l-1].findOffset(
-                            layers[l].viewAt(entryPointOffset).getEntityId());
-                    if (fallback >= 0) entryOffset = fallback;
-                    break;
-                }
+        if (entryOffset == -1L) {
+            for (int l = nodeMaxLayer; l >= 0; l--) {
+                layers[l].allocateNode(entityId, binaryVec, nodeMaxLayer);
+            }
+            topLayer.set(nodeMaxLayer);
+            entryPointOffset = layers[nodeMaxLayer].findOffset(entityId);
+            return;
+        }
+
+        for (int l = currentTopLayer; l > nodeMaxLayer; l--) {
+            entryOffset = layers[l].greedySearch(entryOffset, binaryVec);
+            final long lower = projectOffsetToLayer(layers[l], entryOffset, l - 1);
+            if (lower >= 0) {
+                entryOffset = lower;
+            } else {
+                final long fallback = layers[l - 1].findOffset(
+                        layers[l].viewAt(entryPointOffset).getEntityId());
+                if (fallback >= 0) entryOffset = fallback;
+                break;
             }
         }
 
+        final int insertTopLayer = Math.min(nodeMaxLayer, currentTopLayer);
+        for (int l = nodeMaxLayer; l > insertTopLayer; l--) {
+            layers[l].allocateNode(entityId, binaryVec, nodeMaxLayer);
+        }
+
         final SearchContext ctx = searchContextPool.get();
-        final int insertTopLayer = (entryOffset == -1L) ? 0 : Math.min(nodeMaxLayer, currentTopLayer);
 
         for (int l = insertTopLayer; l >= 0; l--) {
             final long newNodeOffset = layers[l].allocateNode(entityId, binaryVec, nodeMaxLayer);
-
-            if (entryOffset == -1L) {
-                entryPointOffset = newNodeOffset;
-                topLayer.set(nodeMaxLayer);
-                return;
-            }
 
             ctx.candidates.reset();
             ctx.results.reset();
@@ -287,14 +292,15 @@ public final class HNSWIndex implements AutoCloseable {
             if (l > 0 && ctx.results.size() > 0) {
                 ctx.results.sortAscending();
                 final long bestEntityId = layers[l].viewAt(ctx.results.offsetAt(0)).getEntityId();
-                final long lowerOffset  = layers[l - 1].findOffset(bestEntityId);
+                final long lowerOffset = layers[l - 1].findOffset(bestEntityId);
                 entryOffset = (lowerOffset >= 0) ? lowerOffset : newNodeOffset;
             }
         }
 
         if (nodeMaxLayer > currentTopLayer) {
             topLayer.set(nodeMaxLayer);
-            entryPointOffset = layers[nodeMaxLayer].findOffset(entityId);
+            final long ep = layers[nodeMaxLayer].findOffset(entityId);
+            if (ep >= 0) entryPointOffset = ep;
         }
     }
 
@@ -417,10 +423,10 @@ public final class HNSWIndex implements AutoCloseable {
         return layers[targetIdx].findOffset(source.viewAt(offset).getEntityId());
     }
 
-    private static int randomLevel() {
+    private int randomLevel() {
         final double r = ThreadLocalRandom.current().nextDouble();
         final double safe = r == 0.0 ? Double.MIN_VALUE : r;
-        return Math.min((int) (-Math.log(safe) * HNSWConfig.ML), HNSWConfig.MAX_LAYERS - 1);
+        return Math.min((int) (-Math.log(safe) * HNSWConfig.ML), maxLayerCount - 1);
     }
 
     /**

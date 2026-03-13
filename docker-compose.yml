@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  hammingstore:
+    build: .
+    ports:
+      - "50051:50051"
+    environment:
+      PORT: 50051
+      MAX_VECTORS: 500000
+      DIMS: 384
+      DATA_DIR: /data
+    volumes:
+      - hammingstore-data:/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+volumes:
+  hammingstore-data:

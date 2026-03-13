@@ -264,6 +264,64 @@ public final class HammingGrpcService extends HammingStoreGrpc.HammingStoreImplB
         }
     }
 
+    @Override
+    public void storeTypedEdge(
+            final StoreTypedEdgeRequest request,
+            final StreamObserver<StoreTypedEdgeResponse> responseObserver) {
+        try {
+            repository.storeTypedEdge(
+                    request.getSubjectId(),
+                    request.getRelationId(),
+                    request.getObjectId());
+            respond(responseObserver,
+                    StoreTypedEdgeResponse.newBuilder().setSuccess(true).build());
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(Status.INVALID_ARGUMENT
+                    .withDescription(e.getMessage()).asRuntimeException());
+        } catch (Exception e) {
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage()).asRuntimeException());
+        }
+    }
+
+    @Override
+    public void queryHop(
+            final QueryHopRequest request,
+            final StreamObserver<QueryHopResponse> responseObserver) {
+        try {
+            final HNSWIndex.SearchResults results =
+                    reasoner.queryHop(request.getEntityId(), request.getRelationId(), request.getK());
+            respond(responseObserver, QueryHopResponse.newBuilder()
+                    .addAllResults(toProto(results)).build());
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(Status.INVALID_ARGUMENT
+                    .withDescription(e.getMessage()).asRuntimeException());
+        } catch (Exception e) {
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage()).asRuntimeException());
+        }
+    }
+
+    @Override
+    public void queryChain(
+            final QueryChainRequest request,
+            final StreamObserver<QueryChainResponse> responseObserver) {
+        try {
+            final long[] relationIds = request.getRelationIdsList()
+                    .stream().mapToLong(Long::longValue).toArray();
+            final HNSWIndex.SearchResults results =
+                    reasoner.queryChain(request.getStartEntityId(), relationIds, request.getK());
+            respond(responseObserver, QueryChainResponse.newBuilder()
+                    .addAllResults(toProto(results)).build());
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(Status.INVALID_ARGUMENT
+                    .withDescription(e.getMessage()).asRuntimeException());
+        } catch (Exception e) {
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage()).asRuntimeException());
+        }
+    }
+
     /**
      * Converts {@link HNSWIndex.SearchResults} to a list of proto {@link SearchResult} messages.
      */

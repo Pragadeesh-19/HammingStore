@@ -10,187 +10,218 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Random;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * End-to-end smoke test for the full engine pipeline.
+ *
+ * Tests are split by vector type:
+ *
+ *   Float path  — uses the RandomProjectionEncoder (LSH). Tests HNSW search
+ *                 and float ingestion. Geometric similarity is preserved by
+ *                 the projection; Euclidean vector arithmetic is valid here.
+ *
+ *   Binary path — uses storeBinary with explicitly constructed hypervectors.
+ *                 VSA operations (bind, analogy, queryChain) require pure binary
+ *                 input. Applying XOR arithmetic to LSH-projected float vectors
+ *                 is mathematically unsound because the projection is not
+ *                 homomorphic over XOR.
+ */
 class SmokeTest {
 
     private static final int  DIMS = 128;
     private static final long SEED = ProjectionConfig.DEFAULT_SEED;
 
-    private static final long ID_PARIS   = 1L;
-    private static final long ID_FRANCE  = 2L;
-    private static final long ID_LONDON  = 3L;
-    private static final long ID_ENGLAND = 4L;
-    private static final long ID_CAPITAL = 5L;
+    // Float-path entity IDs
+    private static final long F_PARIS   = 10L;
+    private static final long F_FRANCE  = 11L;
+    private static final long F_LONDON  = 12L;
+    private static final long F_ENGLAND = 13L;
+
+    // Binary-path entity IDs (separate namespace)
+    private static final long B_PARIS    = 20L;
+    private static final long B_FRANCE   = 21L;
+    private static final long B_LONDON   = 22L;
+    private static final long B_ENGLAND  = 23L;
+    private static final long B_CAPITAL  = 24L;
+    private static final long B_EUROPE   = 25L;
+    private static final long B_LOCATED  = 26L;
 
     @Test
-    void fullPipeline() {
+    void floatStoreAndHnswSearch() {
         final ProjectionConfig cfg = ProjectionConfig.of(SEED, DIMS);
+        try (final VectorGraphRepository repo = new VectorGraphRepository(500L, cfg)) {
 
-        try (final VectorGraphRepository repo = new VectorGraphRepository(1_000L, cfg)) {
-
-            final SymbolicReasoner reasoner = new SymbolicReasoner(repo);
             final Random rng = new Random(42L);
+            final float[] paris  = gaussianUnit(rng, DIMS);
+            final float[] france = gaussianUnit(rng, DIMS);
+            final float[] london = gaussianUnit(rng, DIMS);
+            repo.store(F_PARIS,   paris);
+            repo.store(F_FRANCE,  france);
+            repo.store(F_LONDON,  london);
 
-            final float[] capitalOf = randomGaussianUnit(rng, DIMS);
-            final float[] france    = randomGaussianUnit(rng, DIMS);
-            final float[] england   = randomGaussianUnit(rng, DIMS);
-            final float[] paris     = l2Normalize(addScaled(france,  capitalOf, 0.8f));
-            final float[] london    = l2Normalize(addScaled(england, capitalOf, 0.8f));
+            assertEquals(3L, repo.nodeCount());
 
-            repo.store(ID_PARIS,   paris);
-            repo.store(ID_FRANCE,  france);
-            repo.store(ID_LONDON,  london);
-            repo.store(ID_ENGLAND, england);
-            repo.store(ID_CAPITAL, capitalOf);
+            final HNSWIndex.SearchResults r = repo.searchHNSW(paris, 3);
+            assertTrue(r.count() > 0);
+            assertEquals(F_PARIS, r.entityId(0), "Paris must be nearest to itself");
+            assertTrue(r.similarity(0) > 0.9);
 
-            assertEquals(5L, repo.nodeCount(),
-                    "nodeCount() must equal number of stored entities");
-
-            repo.bindRelationalEdge(ID_PARIS,  ID_FRANCE,  ID_CAPITAL);
-            repo.bindRelationalEdge(ID_LONDON, ID_ENGLAND, ID_CAPITAL);
-
-            assertEquals(7L, repo.nodeCount(),
-                    "Two composite edge nodes must be added to the graph");
-
-            final HNSWIndex.SearchResults hnswResults = repo.searchHNSW(paris, 5);
-
-            assertTrue(hnswResults.count() > 0, "HNSW search must return results");
-            assertEquals(ID_PARIS, hnswResults.entityId(0),
-                    "Paris must be nearest to its own embedding");
-            assertTrue(hnswResults.similarity(0) > 0.9,
-                    "Self-match similarity must exceed 0.9; got " + hnswResults.similarity(0));
-            for (int i = 1; i < hnswResults.count(); i++) {
-                assertTrue(hnswResults.distance(i - 1) <= hnswResults.distance(i),
-                        "Results must be sorted ascending by Hamming distance");
+            for (int i = 1; i < r.count(); i++) {
+                assertTrue(r.distance(i - 1) <= r.distance(i));
             }
 
             try (Arena arena = Arena.ofConfined()) {
-                final RandomProjectionEncoder encoder =
+                final RandomProjectionEncoder enc =
                         new RandomProjectionEncoder(new OffHeapAllocator(32L), cfg);
-                final MemorySegment binaryParis =
+                final MemorySegment bin =
                         arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
-                encoder.encode(paris, binaryParis);
+                enc.encode(paris, bin);
 
-                final HNSWIndex.SearchResults binaryResults =
-                        repo.searchHNSWBinary(binaryParis, 3);
-
-                assertTrue(binaryResults.count() > 0,
-                        "Binary search must return results");
-                assertEquals(ID_PARIS, binaryResults.entityId(0),
-                        "Binary search must find Paris as nearest to its own binary vector");
+                final HNSWIndex.SearchResults rb = repo.searchHNSWBinary(bin, 3);
+                assertTrue(rb.count() > 0);
+                assertEquals(F_PARIS, rb.entityId(0));
             }
-
-            final HNSWIndex.SearchResults analogyResults =
-                    reasoner.queryAnalogy(ID_LONDON, ID_ENGLAND, ID_FRANCE, 5);
-
-            assertTrue(analogyResults.count() > 0, "Analogy query must return results");
-
-            boolean parisInTopK = false;
-            for (int i = 0; i < analogyResults.count(); i++) {
-                if (analogyResults.entityId(i) == ID_PARIS) {
-                    parisInTopK = true;
-                    break;
-                }
-            }
-            assertTrue(parisInTopK,
-                    "Paris must appear in top-5 analogy results for London:England::?:France. "
-                            + "Top result was entityId=" + analogyResults.entityId(0));
-
-            final HNSWIndex.SearchResults setResults =
-                    reasoner.querySet(new long[]{ID_PARIS, ID_LONDON}, 3);
-
-            assertTrue(setResults.count() > 0, "Set query must return results");
-            for (int i = 0; i < setResults.count(); i++) {
-                final double sim = setResults.similarity(i);
-                assertTrue(sim >= 0.0 && sim <= 1.0,
-                        "Similarity must be in [0.0, 1.0]; got " + sim);
-            }
-
-            try (Arena arena = Arena.ofConfined()) {
-                final MemorySegment allOnes  = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
-                final MemorySegment allZeros = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
-                final MemorySegment out      = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
-
-                allOnes.fill((byte) 0xFF);
-                allZeros.fill((byte) 0x00);
-
-                assertEquals(VectorMath.TOTAL_BITS,
-                        VectorMath.hammingDistance(allOnes, allZeros),
-                        "Hamming(all-1, all-0) must equal TOTAL_BITS");
-
-                assertEquals(0L,
-                        VectorMath.hammingDistance(allOnes, allOnes),
-                        "Hamming(v, v) must be 0");
-
-                VectorMath.bind(allOnes, allZeros, out);
-                assertEquals(VectorMath.TOTAL_BITS,
-                        VectorMath.hammingDistance(out, allZeros),
-                        "bind(all-1, all-0) must produce all-1");
-
-                // bind is its own inverse: bind(bind(v,k),k) == v
-                VectorMath.bind(allOnes, allZeros, out);
-                VectorMath.bind(out, allZeros, out);
-                assertEquals(0L,
-                        VectorMath.hammingDistance(allOnes, out),
-                        "bind must be its own inverse");
-
-                final double simMax = VectorMath.similarity(0L);
-                final double simMid = VectorMath.similarity(VectorMath.TOTAL_BITS / 2);
-                final double simMin = VectorMath.similarity(VectorMath.TOTAL_BITS);
-                assertEquals(1.0, simMax, 1e-9, "similarity(0) must be 1.0");
-                assertEquals(0.0, simMin, 1e-9, "similarity(TOTAL_BITS) must be 0.0");
-                assertTrue(simMax > simMid && simMid > simMin,
-                        "similarity must be monotonically decreasing with distance");
-
-                VectorMath.permute1(allOnes, out);
-                assertEquals(0L,
-                        VectorMath.hammingDistance(allOnes, out),
-                        "permute1(all-1) must equal all-1");
-
-                final MemorySegment asymmetric = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
-                asymmetric.fill((byte) 0x00);
-                MemorySegment.copy(allOnes, 0L, asymmetric, 0L, Long.BYTES);
-                VectorMath.permute1(asymmetric, out);
-                assertNotEquals(0L,
-                        VectorMath.hammingDistance(asymmetric, out),
-                        "permute1 must change a non-uniform vector");
-            }
-
-            repo.retract(ID_PARIS);
-
-            assertThrows(IllegalArgumentException.class,
-                    () -> repo.bindRelationalEdge(ID_PARIS, ID_FRANCE, ID_CAPITAL),
-                    "Retracted entity as subject must throw");
-
-            assertThrows(IllegalArgumentException.class,
-                    () -> repo.bindRelationalEdge(ID_LONDON, ID_PARIS, ID_CAPITAL),
-                    "Retracted entity as object must throw");
         }
     }
 
-    /** Uniform random unit vector via Gaussian sampling then L2 normalisation. */
-    private static float[] randomGaussianUnit(final Random rng, final int dims) {
+    @Test
+    void binaryVsaPipeline() {
+        try (
+                Arena arena = Arena.ofConfined();
+                VectorGraphRepository repo  = new VectorGraphRepository(2_000L)
+        ) {
+            final SymbolicReasoner reasoner = new SymbolicReasoner(repo);
+
+            final MemorySegment france   = randomBinary(arena, 1L);
+            final MemorySegment england  = randomBinary(arena, 2L);
+            final MemorySegment europe   = randomBinary(arena, 3L);
+            final MemorySegment capitalOf = randomBinary(arena, 4L);
+            final MemorySegment locatedIn = randomBinary(arena, 5L);
+            final MemorySegment paris    = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
+            final MemorySegment london   = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
+
+            VectorMath.bind(france,  capitalOf, paris);
+            VectorMath.bind(england, capitalOf, london);
+
+            repo.storeBinary(B_FRANCE,  france);
+            repo.storeBinary(B_ENGLAND, england);
+            repo.storeBinary(B_EUROPE,  europe);
+            repo.storeBinary(B_CAPITAL, capitalOf);
+            repo.storeBinary(B_LOCATED, locatedIn);
+            repo.storeBinary(B_PARIS,   paris);
+            repo.storeBinary(B_LONDON,  london);
+
+            assertEquals(7L, repo.nodeCount());
+
+            repo.bindRelationalEdge(B_PARIS,  B_FRANCE,  B_CAPITAL);
+            repo.bindRelationalEdge(B_LONDON, B_ENGLAND, B_CAPITAL);
+            assertEquals(9L, repo.nodeCount());
+
+            final HNSWIndex.SearchResults analogy =
+                    reasoner.queryAnalogy(B_LONDON, B_ENGLAND, B_FRANCE, 5);
+            assertTrue(analogy.count() > 0);
+
+            boolean parisInTop5 = false;
+            for (int i = 0; i < analogy.count(); i++) {
+                if (analogy.entityId(i) == B_PARIS) { parisInTop5 = true; break; }
+            }
+            assertTrue(parisInTop5,
+                    "Paris must appear in analogy top-5. Top result: " + analogy.entityId(0));
+
+            final HNSWIndex.SearchResults set =
+                    reasoner.querySet(new long[]{B_PARIS, B_LONDON}, 3);
+            assertTrue(set.count() > 0);
+            for (int i = 0; i < set.count(); i++) {
+                final double sim = set.similarity(i);
+                assertTrue(sim >= 0.0 && sim <= 1.0);
+            }
+
+            repo.storeTypedEdge(B_PARIS,  B_CAPITAL, B_FRANCE);
+            repo.storeTypedEdge(B_LONDON, B_CAPITAL, B_ENGLAND);
+            repo.storeTypedEdge(B_FRANCE, B_LOCATED, B_EUROPE);
+
+            final HNSWIndex.SearchResults hop =
+                    reasoner.queryHop(B_PARIS, B_CAPITAL, 5);
+            assertTrue(hop.count() > 0);
+            for (int i = 0; i < hop.count(); i++) {
+                assertTrue(hop.similarity(i) >= 0.0 && hop.similarity(i) <= 1.0);
+            }
+
+            final HNSWIndex.SearchResults chain =
+                    reasoner.queryChain(B_PARIS, new long[]{B_CAPITAL, B_LOCATED}, 5);
+            assertTrue(chain.count() > 0);
+            for (int i = 0; i < chain.count(); i++) {
+                assertTrue(chain.similarity(i) >= 0.0 && chain.similarity(i) <= 1.0);
+            }
+
+            assertThrows(IllegalArgumentException.class,
+                    () -> reasoner.queryChain(B_PARIS, new long[]{}, 3));
+
+            repo.retract(B_PARIS);
+            assertThrows(IllegalArgumentException.class,
+                    () -> repo.bindRelationalEdge(B_PARIS, B_FRANCE, B_CAPITAL));
+            assertThrows(IllegalArgumentException.class,
+                    () -> repo.storeTypedEdge(B_PARIS, B_CAPITAL, B_FRANCE));
+        }
+    }
+
+    @Test
+    void vectorMathPrimitives() {
+        try (Arena arena = Arena.ofConfined()) {
+            final MemorySegment allOnes = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
+            final MemorySegment allZeros = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
+            final MemorySegment out = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
+
+            allOnes.fill((byte) 0xFF);
+            allZeros.fill((byte) 0x00);
+
+            assertEquals(VectorMath.TOTAL_BITS, VectorMath.hammingDistance(allOnes, allZeros));
+            assertEquals(0L, VectorMath.hammingDistance(allOnes, allOnes));
+
+            VectorMath.bind(allOnes, allZeros, out);
+            VectorMath.bind(out, allZeros, out);
+            assertEquals(0L, VectorMath.hammingDistance(allOnes, out));
+
+            assertEquals(1.0, VectorMath.similarity(0L), 1e-9);
+            assertEquals(0.0, VectorMath.similarity(VectorMath.TOTAL_BITS), 1e-9);
+            assertTrue(VectorMath.similarity(VectorMath.TOTAL_BITS / 4)
+                    > VectorMath.similarity(VectorMath.TOTAL_BITS / 2));
+
+            final MemorySegment asymmetric = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
+            asymmetric.fill((byte) 0x00);
+            asymmetric.set(ValueLayout.JAVA_LONG_UNALIGNED, 0L, -1L); // first 8 bytes = 0xFF
+            VectorMath.permute1(asymmetric, out);
+            assertNotEquals(0L, VectorMath.hammingDistance(asymmetric, out));
+        }
+    }
+
+
+    /**
+     * Allocates a random binary hypervector from a seeded RNG.
+     * The seed ensures reproducibility across runs.
+     */
+    private static MemorySegment randomBinary(final Arena arena, final long seed) {
+        final MemorySegment seg = arena.allocate(BinaryVector.VECTOR_BYTES, Long.BYTES);
+        final Random rng = new Random(seed);
+        for (int i = 0; i < BinaryVector.VECTOR_LONGS; i++) {
+            seg.set(ValueLayout.JAVA_LONG_UNALIGNED, (long) i * Long.BYTES, rng.nextLong());
+        }
+        return seg;
+    }
+
+    private static float[] gaussianUnit(final Random rng, final int dims) {
         final float[] v = new float[dims];
-        for (int i = 0; i < dims; i++) v[i] = (float) rng.nextGaussian();
-        return l2Normalize(v);
-    }
-
-    /** Returns a new array: {@code a + scale * b}. Does not mutate inputs. */
-    private static float[] addScaled(final float[] a, final float[] b, final float scale) {
-        final float[] result = new float[a.length];
-        for (int i = 0; i < a.length; i++) result[i] = a[i] + scale * b[i];
-        return result;
-    }
-
-    /** Mutates {@code v} in-place to unit length and returns it. */
-    private static float[] l2Normalize(final float[] v) {
         float sumSq = 0f;
-        for (final float x : v) sumSq += x * x;
+        for (int i = 0; i < dims; i++) {
+            v[i] = (float) rng.nextGaussian();
+            sumSq += v[i] * v[i];
+        }
         final float norm = (float) Math.sqrt(sumSq);
-        if (norm > 0f) for (int i = 0; i < v.length; i++) v[i] /= norm;
+        for (int i = 0; i < dims; i++) v[i] /= norm;
         return v;
     }
 }

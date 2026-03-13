@@ -210,13 +210,6 @@ public final class SparseEntityIndex {
         return size;
     }
 
-    /**
-     * Returns the total slot capacity of the underlying hash table.
-     */
-    public long capacity() {
-        return capacity;
-    }
-
     private static long nextPowerOfTwo(final long v) {
         if (v <= 1L) return 1L;
         return Long.highestOneBit(v - 1L) << 1;
