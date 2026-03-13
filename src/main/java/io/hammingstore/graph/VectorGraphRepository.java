@@ -137,7 +137,7 @@ public final class VectorGraphRepository implements AutoCloseable{
         final Optional<EngineSnapshot> maybeSnap = EngineSnapshot.readFrom(dataDir);
         final EngineSnapshot snap;
 
-        if (maybeSnap.isEmpty()) {
+        if (maybeSnap == null || maybeSnap.isEmpty()) {
             snap = EngineSnapshot.fresh(
                     projectionConfig.inputDimensions(),
                     projectionConfig.seed(),
