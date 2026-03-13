@@ -1,35 +1,40 @@
-app = "hammingstore"
-primary_region = "lhr"
+# fly.toml app configuration file generated for hammingstore on 2026-03-13T18:45:22Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'hammingstore'
+primary_region = 'lhr'
 
 [build]
-dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-PORT = "50051"
-MAX_VECTORS = "200000"
-DIMS = "384"
-DATA_DIR = "/data"
+  DATA_DIR = '/data'
+  DIMS = '384'
+  MAX_VECTORS = '200000'
+  PORT = '50051'
+
+[[mounts]]
+  source = 'hammingstore_data'
+  destination = '/data'
+  initial_size = '1gb'
 
 [[services]]
-protocol = "tcp"
-internal_port = 50051
+  protocol = 'tcp'
+  internal_port = 50051
 
-[[services.ports]]
-port = 50051
-handlers = ["tls"]
-tls_options = { alpn = ["h2"] }
+  [[services.ports]]
+    port = 50051
+    handlers = ['tls', 'http']
+    tls_options = { alpn = ['h2'] }
 
-[services.concurrency]
-type = "requests"
-soft_limit = 50
-hard_limit = 100
-
-[mounts]
-source = "hammingstore_data"
-destination = "/data"
-initial_size = "1gb"
+  [services.concurrency]
+    type = 'requests'
+    hard_limit = 100
+    soft_limit = 50
 
 [[vm]]
-memory = "1gb"
-cpu_kind = "shared"
-cpus = 1
+  memory = '1gb'
+  cpus = 1
+  memory_mb = 1024
