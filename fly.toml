@@ -29,10 +29,9 @@ primary_region = 'lhr'
     handlers = ['http']
 
   [[services.ports]]
-    port = 8080
+    port = 443
     handlers = ['tls', 'http']
-    [services.ports.tls.options]
-      alpn = ['http/1.1', 'h2']
+    tls_options = { alpn = ['http/1.1', 'h2']}
 
   [services.concurrency]
     type = 'connections'
