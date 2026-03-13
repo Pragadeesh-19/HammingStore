@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y maven && \
     mvn clean package -DskipTests -q && \
     mv target/hammingstore-core-*.jar target/hammingstore.jar
 
-FROM eclipse-temurin:22-jre-jammy
+FROM eclipse-temurin:22-jdk-jammy
 
 WORKDIR /app
 
