@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        hammingstore-client: the Java client SDK.
+
+        Design principles:
+          - ZERO proto leakage: no io.hammingstore.grpc.proto.* types in public API.
+          - All public types live in io.hammingstore.client (never .internal).
+          - Immutable domain objects: Entity, Edge, SearchResult are Java records.
+          - Fluent DSL: client.from("Paris").via("capitalOf").topK(5).execute()
+          - Sync + CompletableFuture async + optional Project Reactor reactive.
+          - EntityIdResolver is an interface - users can override the default SHA256.
+
+        Depends on:
+          - hammingstore-core (for proto-generated stubs)
+          - reactor-core (optional - only needed if using .executeReactive())
+
+        Produces: hammingstore-client-1.0.0-SNAPSHOT.jar (thin JAR, no shading)
+    -->
+
+    <parent>
+        <groupId>io.hammingstore</groupId>
+        <artifactId>hammingstore-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>hammingstore-client</artifactId>
+    <packaging>jar</packaging>
+    <name>HammingStore :: Java Client SDK</name>
+
+    <dependencies>
+
+        <dependency>
+            <groupId>io.hammingstore</groupId>
+            <artifactId>hammingstore-core</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-netty-shaded</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-stub</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>javax.annotation</groupId>
+            <artifactId>javax.annotation-api</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.projectreactor</groupId>
+            <artifactId>reactor-core</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

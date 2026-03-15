@@ -1,22 +1,29 @@
 FROM eclipse-temurin:22-jdk-jammy AS builder
 
 WORKDIR /build
+
 COPY pom.xml .
-COPY src ./src
+COPY hammingstore-core/pom.xml hammingstore-core/
+COPY hammingstore-client/pom.xml hammingstore-client/
 
 RUN apt-get update && apt-get install -y maven && \
-    mvn clean package -DskipTests -q && \
-    mv target/hammingstore-core-*.jar target/hammingstore.jar
+    mvn dependency:go-offline -q || true
+
+COPY hammingstore-core/src hammingstore-core/src
+COPY hammingstore-client/src hammingstore-client/src
+
+RUN mvn clean package -DskipTests -q && \
+    mv hammingstore-core/target/hammingstore-core-*.jar hammingstore-core/target/hammingstore.jar
 
 FROM eclipse-temurin:22-jdk-jammy
 
 WORKDIR /app
 
-COPY --from=builder /build/target/hammingstore.jar .
+COPY --from=builder /build/hammingstore-core/target/hammingstore.jar .
 
 RUN mkdir -p /data
 
-EXPOSE 50051
+EXPOSE 50051 8080
 
 ENV MAX_VECTORS=500000
 ENV DIMS=384
