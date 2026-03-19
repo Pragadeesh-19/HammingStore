@@ -27,6 +27,7 @@
         <module>hammingstore-core</module>
         <module>hammingstore-client</module>
         <module>hammingstore-spring-boot-starter</module>
+        <module>hammingstore-spring-data</module>
     </modules>
 
     <properties>
@@ -145,6 +146,21 @@
                 <artifactId>mockito-core</artifactId>
                 <version>${mockito.version}</version>
                 <scope>test</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.github.resilience4j</groupId>
+                <artifactId>resilience4j-core</artifactId>
+                <version>2.1.0</version>
+            </dependency>
+            <dependency>
+                <groupId>io.hammingstore</groupId>
+                <artifactId>hammingstore-spring-data</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.hammingstore</groupId>
+                <artifactId>hammingstore-spring-boot-starter</artifactId>
+                <version>${project.version}</version>
             </dependency>
 
         </dependencies>
