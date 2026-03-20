@@ -28,6 +28,7 @@
         <module>hammingstore-client</module>
         <module>hammingstore-spring-boot-starter</module>
         <module>hammingstore-spring-data</module>
+        <module>hammingstore-bom</module>
     </modules>
 
     <properties>
