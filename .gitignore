@@ -40,7 +40,7 @@ build/
 
 *.jar
 embedding-cache/
-data/
+/data/
 *.npy
 
 benchmark/hammingstore_pb2.py
