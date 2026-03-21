@@ -1,7 +1,6 @@
 package io.hammingstore.hnsw;
 
-import io.hammingstore.math.VectorMath;
-import io.hammingstore.memory.BinaryVector;
+import io.hammingstore.memory.OffHeapVectorStore;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -13,6 +12,13 @@ import java.lang.foreign.ValueLayout;
  * laid out as described in {@link HNSWConfig}. This class provides typed accessors
  * that read and write directly into the underlying {@link MemorySegment} with no
  * heap allocation - it is a zero-copy lens over the raw storage.
+ *
+ * <h2>SCHEMA_V2 layout</h2>
+ * <p>The binary vector has been removed from the node. In its place, the node
+ * stores a {@link HNSWConfig#NODE_OFFSET_VECTOR_STORE_OFFSET vectorStoreOffset}
+ * - a direct byte offset into {@link io.hammingstore.memory.OffHeapVectorStore}.
+ * This allows {@link HNSWLayer#distanceTo} to fetch the vector in a single
+ * arithmetic operation with no hash lookup.
  *
  * <p>Instances are lightweight and short-lived. They are created on demand by
  * {@link HNSWLayer#viewAt(long)} and discarded after each graph operation.
@@ -33,9 +39,35 @@ final class HNSWNodeView {
      HNSWNodeView(final MemorySegment segment) {
         if (segment.byteSize() != HNSWConfig.NODE_BYTES) {
             throw new IllegalArgumentException(
-                    "Segment must be exactly " + HNSWConfig.NODE_BYTES + " bytes, got: " + segment.byteSize());
+                    "Segment must be exactly " + HNSWConfig.NODE_BYTES
+                            + " bytes (SCHEMA_V2 node layout), got: "
+                            + segment.byteSize());
         }
         this.segment = segment;
+    }
+
+    /**
+     * Returns the direct byte offset of this node's binary vector within
+     * {@link io.hammingstore.memory.OffHeapVectorStore}.
+     *
+     * <p>This is the hot-loop accessor. It is in the same 280-byte cache line
+     * as the entity ID and neighbor count, so it is typically already in L1
+     * when {@link HNSWLayer#distanceTo} is called.
+     */
+    long getVectorStoreOffset() {
+         return segment.get(ValueLayout.JAVA_LONG_UNALIGNED,
+                 HNSWConfig.NODE_OFFSET_VECTOR_STORE_OFFSET);
+    }
+
+    /**
+     * Writes the direct byte offset of this node's binary vector.
+     * Called exactly once, from {@link HNSWLayer#allocateNode}, at insert time.
+     *
+     * @param offset the byte offset returned by {@link OffHeapVectorStore#allocateSlot()}
+     */
+    void setVectorStoreOffset(final long offset) {
+        segment.set(ValueLayout.JAVA_LONG_UNALIGNED,
+                HNSWConfig.NODE_OFFSET_VECTOR_STORE_OFFSET, offset);
     }
 
      long getEntityId() {
@@ -44,14 +76,6 @@ final class HNSWNodeView {
 
     void setEntityId(final long entityId) {
         segment.set(ValueLayout.JAVA_LONG_UNALIGNED, HNSWConfig.NODE_OFFSET_ENTITY_ID, entityId);
-    }
-
-     MemorySegment getVectorSlice() {
-        return segment.asSlice(HNSWConfig.NODE_OFFSET_VECTOR, BinaryVector.VECTOR_BYTES);
-    }
-
-     void setVector(final MemorySegment source) {
-        MemorySegment.copy(source, 0L, segment, HNSWConfig.NODE_OFFSET_VECTOR, BinaryVector.VECTOR_BYTES);
     }
 
      int getNeighborCount() {
@@ -108,10 +132,6 @@ final class HNSWNodeView {
                     HNSWConfig.NODE_OFFSET_NEIGHBORS_START + (long) i * Long.BYTES,
                     HNSWConfig.EMPTY_NEIGHBOR);
         }
-    }
-
-     long getVectorDistance(final MemorySegment query) {
-        return VectorMath.hammingDistance(getVectorSlice(), query);
     }
 
     private static void checkNeighborIndex(final int index) {

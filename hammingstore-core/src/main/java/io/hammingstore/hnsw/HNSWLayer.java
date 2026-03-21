@@ -1,6 +1,8 @@
 package io.hammingstore.hnsw;
 
+import io.hammingstore.math.VectorMath;
 import io.hammingstore.memory.OffHeapAllocator;
+import io.hammingstore.memory.OffHeapVectorStore;
 import io.hammingstore.memory.SparseEntityIndex;
 
 import java.lang.foreign.MemorySegment;
@@ -10,12 +12,30 @@ import java.util.concurrent.atomic.AtomicLong;
  * One layer of the HNSW proximity graph.
  *
  * <p>Each layer holds a flat array of fixed-size nodes in off-heap memory.
- * Every node contains an entity ID, a binary hypervector, a neighbour count,
- * the node's max layer assignment, and up to {@link HNSWConfig#M} neighbour
- * offsets. See {@link HNSWConfig} for the exact byte layout.
+ * As of SCHEMA_V2, every node is 280 bytes and contains:
+ * <ul>
+ *   <li>entityId (8 bytes)</li>
+ *   <li>vectorStoreOffset (8 bytes) - direct pointer into OffHeapVectorStore</li>
+ *   <li>neighborCount + nodeLayer (4 + 4 bytes)</li>
+ *   <li>32 neighbour offsets (256 bytes)</li>
+ * </ul>
+ * See {@link HNSWConfig} for the exact layout.
+ *
+ * <h2>Hot-loop distance computation</h2>
+ * <p>Every distance call follows exactly this path:
+ * <pre>
+ *   offset = node.getVectorStoreOffset() // read 8b — same cache line as neighbors
+ *   vec = vectorStore.sliceAt(offset) // base + offset arithmetic, 0 branches
+ *   dist = VectorMath.hammingDistance(vec, query)
+ * </pre>
+ * No hash, no hash-map probe, no pointer chase through SparseEntityIndex.
+ * The {@code vectorStoreOffset} is stored directly in the node so that the vector
+ * lookup is a single arithmetic operation on the hot path.
  *
  * <p>An accompanying {@link SparseEntityIndex} maps entity IDs to their byte
- * offsets within this layer's storage segment, enabling O(1) entity lookup.
+ * offsets within this layer's storage segment, enabling O(1) entity lookup for
+ * graph navigation (cross-layer projection, entry-point restore). It is
+ * <em>not</em> called during distance computation.
  *
  * <h2>Visibility contract</h2>
  * <p>Methods used only by {@link HNSWIndex} (same package) are package-private.
@@ -28,6 +48,7 @@ public final class HNSWLayer {
     private final AtomicLong cursor;
     private final long capacity;
     private final int layerIndex;
+    private final OffHeapVectorStore vectorStore;
 
     /**
      * Creates a new empty layer with freshly allocated off-heap storage.
@@ -35,16 +56,19 @@ public final class HNSWLayer {
      * @param allocator the allocator from which node storage is requested
      * @param capacity maximum number of nodes this layer can hold
      * @param layerIndex the layer number (0 = base layer, higher = sparser)
+     * @param vectorStore the canonical vector slab; used read-only for distance computation.
      * @throws IllegalArgumentException if {@code capacity} is not positive
      */
     public HNSWLayer(
             final OffHeapAllocator allocator,
             final long capacity,
-            final int layerIndex) {
+            final int layerIndex,
+            final OffHeapVectorStore vectorStore) {
 
         if (capacity <= 0) throw new IllegalArgumentException("capacity must be > 0");
         this.capacity   = capacity;
         this.layerIndex = layerIndex;
+        this.vectorStore = vectorStore;
         this.cursor     = new AtomicLong(0L);
         this.storage    = allocator.allocateRawSegment(
                 capacity * HNSWConfig.NODE_BYTES, Long.BYTES);
@@ -67,8 +91,9 @@ public final class HNSWLayer {
             final SparseEntityIndex nodeIndex,
             final long capacity,
             final int layerIndex,
-            final long initialNodeCount) {
-        return new HNSWLayer(nodeStorage, nodeIndex, capacity, layerIndex, initialNodeCount);
+            final long initialNodeCount,
+            final OffHeapVectorStore vectorStore) {
+        return new HNSWLayer(nodeStorage, nodeIndex, capacity, layerIndex, initialNodeCount, vectorStore);
     }
 
     private HNSWLayer(
@@ -76,27 +101,35 @@ public final class HNSWLayer {
             final SparseEntityIndex nodeIndex,
             final long capacity,
             final int layerIndex,
-            final long initialNodeCount) {
+            final long initialNodeCount,
+            final OffHeapVectorStore vectorStore) {
         this.storage = storage;
         this.nodeIndex = nodeIndex;
         this.capacity = capacity;
         this.layerIndex = layerIndex;
         this.cursor = new AtomicLong(initialNodeCount);
+        this.vectorStore = vectorStore;
     }
 
     /**
      * Allocates and initialises a new node slot for {@code entityId}.
      *
+     * <p>Writes the {@code vectorStoreOffset} directly into the node so that
+     * subsequent distance computations require no hash lookup — the vector's
+     * location is embedded in the node itself.
+     *
      * @param entityId the entity this node represents
-     * @param vectorSrc the binary hypervector to store in the node
      * @param nodeMaxLayer the highest layer this entity was assigned to
+     * @param vectorStoreOffset the byte offset of this entity's binary vector
+     *                          in {@link OffHeapVectorStore}, as returned by
+     *                          {@link OffHeapVectorStore#allocateSlot()}
      * @return the byte offset of the newly allocated node within {@code storage}
      * @throws IllegalStateException if the layer is already at capacity
      */
      long allocateNode(
             final long entityId,
-            final MemorySegment vectorSrc,
-            final int nodeMaxLayer) {
+            final int nodeMaxLayer,
+            final long vectorStoreOffset) {
 
         final long slotIndex = cursor.getAndIncrement();
         if (slotIndex >= capacity) {
@@ -108,7 +141,7 @@ public final class HNSWLayer {
         final HNSWNodeView view = viewAt(offset);
 
         view.setEntityId(entityId);
-        view.setVector(vectorSrc);
+        view.setVectorStoreOffset(vectorStoreOffset);
         view.setNodeLayer(nodeMaxLayer);
         view.initNeighbors();
 
@@ -132,16 +165,16 @@ public final class HNSWLayer {
 
         while (true) {
             final HNSWNodeView current = viewAt(currentOffset);
-            final long currentDist    = current.getVectorDistance(query);
+            final long currentDist = distanceTo(currentOffset, query);
             long bestOffset = currentOffset;
-            long bestDist   = currentDist;
+            long bestDist = currentDist;
 
             final int neighborCount = current.getNeighborCount();
             for (int i = 0; i < neighborCount; i++) {
                 final long neighborOffset = current.getNeighbor(i);
                 if (neighborOffset == HNSWConfig.EMPTY_NEIGHBOR) continue;
 
-                final long d = viewAt(neighborOffset).getVectorDistance(query);
+                final long d = distanceTo(neighborOffset, query);
                 if (d < bestDist) {
                     bestDist   = d;
                     bestOffset = neighborOffset;
@@ -192,20 +225,20 @@ public final class HNSWLayer {
             final CandidateMinHeap candidates,
             final VisitedTracker visited) {
 
-        final long entryDist = viewAt(entryOffset).getVectorDistance(query);
+        final long entryDist = distanceTo(entryOffset, query);
         candidates.push(entryOffset, entryDist);
         results.offer(entryOffset, entryDist);
         visited.visit(entryOffset);
 
         while (!candidates.isEmpty()) {
-            final long cDist   = candidates.peekMinDistance();
+            final long cDist = candidates.peekMinDistance();
             final long worstResult = results.peekMaxDistance();
 
             if (cDist > worstResult) break;
 
             final long cOffset = candidates.popMinOffset();
             final HNSWNodeView cView = viewAt(cOffset);
-            final int neighborCount  = cView.getNeighborCount();
+            final int neighborCount = cView.getNeighborCount();
 
             for (int i = 0; i < neighborCount; i++) {
                 final long nOffset = cView.getNeighbor(i);
@@ -213,7 +246,7 @@ public final class HNSWLayer {
                 if (visited.isVisited(nOffset)) continue;
 
                 visited.visit(nOffset);
-                final long nDist = viewAt(nOffset).getVectorDistance(query);
+                final long nDist = distanceTo(nOffset, query);
 
                 if (nDist < worstResult || !results.isFull()) {
                     results.offer(nOffset, nDist);
@@ -275,6 +308,30 @@ public final class HNSWLayer {
     }
 
     /**
+     * Returns the Hamming distance between the node at {@code nodeOffset} and
+     * {@code query}.
+     *
+     * <p>This is the sole distance entry point for the entire layer. The path is:
+     * <ol>
+     *   <li>{@code node.getVectorStoreOffset()} - reads 8 bytes already in the
+     *       node's cache line</li>
+     *   <li>{@code vectorStore.sliceAt(offset)} - {@code base + offset} arithmetic,
+     *       no branches</li>
+     *   <li>{@code VectorMath.hammingDistance()} - POPCNT on 157 longs</li>
+     * </ol>
+     * No {@link SparseEntityIndex} lookup. No hash. No random memory jump beyond
+     * the vector fetch itself.
+     *
+     * @param nodeOffset byte offset of the node within this layer's storage
+     * @param query the query hypervector
+     * @return Hamming distance
+     */
+    long distanceTo(final long nodeOffset, final MemorySegment query) {
+         final long vectorStoreOffset = viewAt(nodeOffset).getVectorStoreOffset();
+         return VectorMath.hammingDistance(vectorStore.sliceAt(vectorStoreOffset), query);
+    }
+
+    /**
      * Replaces {@code node}'s neighbour list with the best {@code mMax}
      * connections from its current neighbours plus {@code candidateOffset}.
      *
@@ -298,17 +355,19 @@ public final class HNSWLayer {
         final long[] scratchDistances = new long[mMax + 1];
         int scratchSize = 0;
 
-        final MemorySegment nodeVec = node.getVectorSlice();
+        final MemorySegment nodeVec = vectorStore.sliceAt(node.getVectorStoreOffset());
         for (int i = 0; i < existing; i++) {
             final long off = node.getNeighbor(i);
             if (off != HNSWConfig.EMPTY_NEIGHBOR) {
                 scratchOffsets[scratchSize]   = off;
-                scratchDistances[scratchSize] = viewAt(off).getVectorDistance(nodeVec);
+                scratchDistances[scratchSize] = VectorMath.hammingDistance(
+                        vectorStore.sliceAt(viewAt(off).getVectorStoreOffset()), nodeVec);
                 scratchSize++;
             }
         }
         scratchOffsets[scratchSize]   = candidateOffset;
-        scratchDistances[scratchSize] = viewAt(candidateOffset).getVectorDistance(nodeVec);
+        scratchDistances[scratchSize] = VectorMath.hammingDistance(
+                vectorStore.sliceAt(viewAt(candidateOffset).getVectorStoreOffset()), nodeVec);
         scratchSize++;
 
         for (int i = 1; i < scratchSize; i++) {
@@ -331,5 +390,4 @@ public final class HNSWLayer {
             node.addNeighbor(scratchOffsets[i]);
         }
     }
-
 }

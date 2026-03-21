@@ -1,35 +1,56 @@
 package io.hammingstore.hnsw;
 
-import io.hammingstore.memory.BinaryVector;
-
 /**
  * Compile-time constants for the HNSW graph index.
  *
  * <p>All tuneable parameters ({@link #M}, {@link #EF_CONSTRUCTION}, etc.) and all
- * structural layout constants ({@link #NODE_BYTES}, {@link #NODE_OFFSET_VECTOR},
+ * structural layout constants ({@link #NODE_BYTES}, {@link #NODE_OFFSET_VECTOR_STORE_OFFSET},
  * etc.) live here so they have a single authoritative source across
- * {@link HNSWLayer}, {@link HNSWNodeView}, {@link HNSWIndex}, and
+ * {@link HNSWLayer}, {@link HNSWNodeView}, {@link HNSWIndex} and
  * {@link io.hammingstore.hnsw.VisitedTracker}.
  *
- * <h2>On-disk layout contract</h2>
+ * <h2>On-disk layout contract - SCHEMA_V2</h2>
  * <p>The {@code NODE_OFFSET_*} and {@code NODE_BYTES} constants define the exact
  * binary layout of every node written to the memory-mapped layer files. Changing
  * any of these values invalidates all persisted indexes. Never change them without
  * a corresponding migration and a version bump in
  * {@link io.hammingstore.persist.EngineSnapshot}.
  *
- * <h2>Node memory layout (1,536 bytes per node)</h2>
+ * <h2>Node memory layout - SCHEMA_V2 (280 bytes per node)</h2>
  * <pre>
  * Offset  Size   Field
  * ------  ----   -----
- *      0     8   entity ID           (long)
- *      8  1256   binary vector       (10,048 bits = 157 longs × 8 bytes)
- *   1264     4   neighbor count      (int)
- *   1268     4   node layer          (int)
- *   1272   256   neighbor offsets    (32 longs × 8 bytes = M × Long.BYTES)
- *                                    ────────────────────────────────────
- *                                    Total: 1272 + 256 = 1,528 → padded to 1,536
+ *      0     8   entityId              (long)
+ *      8     8   vectorStoreOffset     (long) - direct byte offset into OffHeapVectorStore
+ *     16     4   neighborCount         (int)
+ *     20     4   nodeLayer             (int)
+ *     24   256   neighborOffsets       (32 longs × 8 bytes = M × Long.BYTES)
+ *                                      ─────────────────────────────────────
+ *                                      Total: 280 bytes (naturally 8-byte aligned)
  * </pre>
+ *
+ * <h2>Design rationale — why vectorStoreOffset lives in the node</h2>
+ * <p>During {@link HNSWLayer#efSearch}, the engine examines hundreds of nodes and
+ * up to 32 neighbours per node. Every examination requires a Hamming distance
+ * computation, which requires the stored binary vector.
+ *
+ * <p>Storing {@code vectorStoreOffset} directly in the node means fetching the vector
+ * is a single arithmetic operation: {@code vectorStore.sliceAt(vectorStoreOffset)}.
+ * No hash computation, no hash-map lookup, no pointer chase through
+ * {@link io.hammingstore.memory.SparseEntityIndex}. The offset is in the same
+ * 280-byte cache line as the neighbour list, so it is frequently already in L1
+ * when the distance call is made.
+ *
+ * <p>This is 8 bytes more per node than the pure-metadata layout (272 bytes), but
+ * eliminates up to 1,472 hash-map lookups per search query that would otherwise
+ * destroy L3 cache locality. The memory cost is negligible; the latency benefit
+ * is decisive.
+ *
+ * <h2>Breaking change from SCHEMA_V1</h2>
+ * <p>SCHEMA_V1 embedded the full 1,256-byte binary vector in the node
+ * (NODE_BYTES = 1,536). SCHEMA_V2 replaces it with an 8-byte direct offset
+ * pointer, reducing node size by 5.49x. Existing SCHEMA_V1 snapshot files are
+ * rejected at startup with a migration message.
  */
 public final class HNSWConfig {
 
@@ -88,30 +109,44 @@ public final class HNSWConfig {
      */
     public static final double ML = 1.0/ Math.log(M);
 
-    public static final long NODE_OFFSET_ENTITY_ID       = 0L;
+    public static final long NODE_OFFSET_ENTITY_ID = 0L;
 
-    public static final long NODE_OFFSET_VECTOR          = 8L;
+    /**
+     * Byte offset of the vectorStoreOffset field (long, 8 bytes).
+     * Holds the direct byte offset of this entity's binary vector inside
+     * {@link io.hammingstore.memory.OffHeapVectorStore}. Written once at
+     * {@link HNSWLayer#allocateNode} time and never updated.
+     */
+    public static final long NODE_OFFSET_VECTOR_STORE_OFFSET = 8L;
 
-    public static final long NODE_OFFSET_NEIGHBOR_COUNT  = 1264L;
+    /**
+     * Byte offset of the neighborCount field (int, 4 bytes).
+     * Follows vectorStoreOffset: 8 + 8 = 16.
+     */
+    public static final long NODE_OFFSET_NEIGHBOR_COUNT = 16L;
 
-    public static final long NODE_OFFSET_NODE_LAYER      = 1268L;
+    /**
+     * Byte offset of the nodeLayer field (int, 4 bytes).
+     * Follows neighborCount: 16 + 4 = 20.
+     */
+    public static final long NODE_OFFSET_NODE_LAYER = 20L;
 
     /**
      * Byte offset of the neighbor-offset array within a node.
-     * Immediately follows the node-layer field (4-byte int): 1,268 + 4 = 1,272.
-     * The array contains {@link #M} longs (8 bytes each), each holding the byte
+     * Immediately follows the node-layer field (4-byte int): 20 + 4 = 24.
+     * The array contains {@link #M} longs, each holding the byte
      * offset of a neighbor node within the same layer's storage segment, or
      * {@link #EMPTY_NEIGHBOR} if the slot is unused.
      */
-    public static final long NODE_OFFSET_NEIGHBORS_START = 1272L;
+    public static final long NODE_OFFSET_NEIGHBORS_START = 24L;
 
     /**
-     * Total size of one node in bytes.
-     * Layout: 8 (entity ID) + 1,256 (vector) + 4 (count) + 4 (layer) + 256 (neighbors) = 1,528,
-     * rounded up to 1,536 for alignment.
-     * All layer storage segments are allocated as a multiple of this value.
+     * Total size of one node in bytes — SCHEMA_V2.
+     * Layout: 8 (entityId) + 8 (vectorStoreOffset) + 4 (count) + 4 (layer)
+     *         + 256 (32 neighbours × 8) = 280.
+     * Naturally 8-byte aligned. No padding required.
      */
-    public static final long NODE_BYTES = 1536L;
+    public static final long NODE_BYTES = 280L;
 
     public static final long EMPTY_NEIGHBOR = -1L;
 

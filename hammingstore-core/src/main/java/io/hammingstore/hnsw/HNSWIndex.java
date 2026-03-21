@@ -3,6 +3,7 @@ package io.hammingstore.hnsw;
 import io.hammingstore.math.VectorMath;
 import io.hammingstore.memory.BinaryVector;
 import io.hammingstore.memory.OffHeapAllocator;
+import io.hammingstore.memory.OffHeapVectorStore;
 
 import java.lang.foreign.MemorySegment;
 import java.util.concurrent.ThreadLocalRandom;
@@ -19,6 +20,14 @@ import java.util.concurrent.locks.StampedLock;
  * the top layer and work downward, refining the candidate set at each level.
  *
  * <p>Distance is measured as hamming distance between 10,048-bit binary vectors.
+ * As of SCHEMA_V2, each node stores a direct {@code vectorStoreOffset} pointing
+ * into {@link io.hammingstore.memory.OffHeapVectorStore}. Distance computation is:
+ * <pre>
+ *   offset = node.getVectorStoreOffset()
+ *   vec = vectorStore.sliceAt(offset)
+ *   dist = VectorMath.hammingDistance(vec, query)
+ * </pre>
+ * No hash, no hash-map lookup, no lambda.
  *
  * <h2>Thread safety</h2>
  * <p>Concurrent reads are supported via optimistically read with {@link StampedLock}.
@@ -56,16 +65,19 @@ public final class HNSWIndex implements AutoCloseable {
     private final StampedLock lock = new StampedLock();
 
     private volatile long entryPointOffset = -1L;
+    private volatile long entryPointEntityId = -1L;
     private final AtomicInteger topLayer = new AtomicInteger(0);
+
     private final ThreadLocal<SearchContext> searchContextPool;
 
     /**
      * Creates a new empty index with fresh off-heap storage.
      *
      * @param maxNodes maximum number of vectors the index can hold
+     * @param vectorStore the canonical vector slab shared with VectorGraphRepository
      * @throws IllegalArgumentException if {@code maxNodes} is not positive
      */
-    public HNSWIndex(final long maxNodes) {
+    public HNSWIndex(final long maxNodes, final OffHeapVectorStore vectorStore) {
         if (maxNodes <= 0) throw new IllegalArgumentException("maxNodes must be > 0");
         this.maxNodes = maxNodes;
         this.allocator = new OffHeapAllocator(maxNodes);
@@ -73,68 +85,67 @@ public final class HNSWIndex implements AutoCloseable {
         this.layers = new HNSWLayer[maxLayerCount];
 
         for (int l = 0; l < maxLayerCount; l++) {
-            layers[l] = new HNSWLayer(allocator, computeLayerCapacity(maxNodes, l), l);
+            layers[l] = new HNSWLayer(allocator, computeLayerCapacity(maxNodes, l), l, vectorStore);
         }
 
-        this.searchContextPool = ThreadLocal.withInitial(() ->
-                new SearchContext(
-                        new CandidateMinHeap(HNSWConfig.EF_CONSTRUCTION),
-                        new TopKBuffer(HNSWConfig.EF_CONSTRUCTION),
-                        new VisitedTracker(new OffHeapAllocator(maxNodes), maxNodes)
-                )
-        );
+        this.searchContextPool = buildContextPool(maxNodes);
     }
 
     /**
      * Restores an index from pre-built layers loaded from memory-mapped files.
      * Used exclusively by {@link io.hammingstore.graph.VectorGraphRepository}
-     * during snapshot restore.
-     *
-     * <p>The {@code allocator} is set to {@code null} in this path - the layers own
-     * their own storage segments provided by the mapped file allocator.
+     * during snapshot restore. Layers already carry their own {@link OffHeapVectorStore}
+     * reference (injected at {@link HNSWLayer#fromMapped} time).
      *
      * @param prebuildLayers layers loaded from mapped files.
      * @param maxNodes maximum capacity the index was originally built for
      * @param initialEntryPointOffset byte offset of the entry point node in layer 0
+     * @param initialEntryPointEntityId entityId of the entry point (-1 if empty)
      * @param initialTopLayer the highest populated layer at snapshot time.
      */
     public HNSWIndex(
             final HNSWLayer[] prebuildLayers,
             final long maxNodes,
             final long initialEntryPointOffset,
+            final long initialEntryPointEntityId,
             final int initialTopLayer) {
         this.layers = prebuildLayers;
         this.maxLayerCount = prebuildLayers.length;
         this.maxNodes = maxNodes;
         this.allocator = null;
         this.entryPointOffset = initialEntryPointOffset;
+        this.entryPointEntityId = initialEntryPointEntityId;
         this.topLayer.set(initialTopLayer);
 
-        this.searchContextPool = ThreadLocal.withInitial(() ->
-                new SearchContext(
-                        new CandidateMinHeap(HNSWConfig.EF_CONSTRUCTION),
-                        new TopKBuffer(HNSWConfig.EF_CONSTRUCTION),
-                        new VisitedTracker(new OffHeapAllocator(maxNodes), maxNodes)
-                )
-        );
+        this.searchContextPool = buildContextPool(maxNodes);
     }
 
     /**
-     * Inserts a pre-binarized hypervector into the index.
+     * Inserts an entity into the HNSW graph.
+     *
+     * <p>The entity's vector must already be stored in {@link OffHeapVectorStore}
+     * and the {@code vectorStoreOffset} must be the byte offset returned by
+     * {@link OffHeapVectorStore#allocateSlot()}. This offset is written directly
+     * into each node so that distance computation requires no hash lookup.
+     *
+     * <p>The {@code binaryVec} parameter is used as the query vector during graph
+     * traversal (greedy descent and beam search), avoiding a vectorStore lookup
+     * on the insert path itself.
      *
      * @param entityId the entity identifier to associate with this vector
      * @param binaryVec the binary hypervector; must be exactly
      *                  {@link BinaryVector#VECTOR_BYTES} bytes
+     * @param vectorStoreOffset byte offset of {@code binaryVec} in OffHeapVectorStore
      * @throws IllegalArgumentException if the vector has the wrong size
      */
-    public void insertBinary(final long entityId, final MemorySegment binaryVec) {
+    public void insertBinary(final long entityId, final MemorySegment binaryVec, final long vectorStoreOffset) {
         if (binaryVec.byteSize() != BinaryVector.VECTOR_BYTES) {
             throw new IllegalArgumentException(
                     "binaryVec must be " + BinaryVector.VECTOR_BYTES + " bytes");
         }
         final long stamp = lock.writeLock();
         try {
-            insertInternal(entityId, binaryVec);
+            insertInternal(entityId, binaryVec, vectorStoreOffset);
         } finally {
             lock.unlockWrite(stamp);
         }
@@ -174,39 +185,11 @@ public final class HNSWIndex implements AutoCloseable {
         return result;
     }
 
-    /**
-     * Linear scan over all layer-0 nodes returning the exact {@code k} nearest
-     * neighbours by Hamming distance.
-     *
-     * <p>This bypasses graph traversal entirely and is O(N). It is used as the
-     * authoritative search path while graph traversal correctness is being
-     * validated, and as a fallback for small datasets where HNSW provides no
-     * meaningful speedup.
-     *
-     * @param query the query hypervector
-     * @param k number of nearest neighbours to return
-     * @return the k nearest results sorted by ascending Hamming distance
-     * @throws IllegalArgumentException if k ≤ 0
-     */
-    public SearchResults bruteForceSearch(final MemorySegment query, final int k) {
-        if (k <= 0) throw new IllegalArgumentException("K must be > 0");
-
-        long stamp = lock.tryOptimisticRead();
-        SearchResults result = bruteForceInternal(query, k);
-        if (!lock.validate(stamp)) {
-            stamp = lock.readLock();
-            try {
-                result = bruteForceInternal(query, k);
-            } finally {
-                lock.unlockRead(stamp);
-            }
-        }
-        return result;
-    }
-
     public int activeLayerCount() { return topLayer.get() + 1; }
 
     public long entryPointOffset() { return entryPointOffset; }
+
+    public long entryPointEntityId() { return entryPointEntityId; }
 
     public long size() { return layers[0].nodeCount(); }
 
@@ -242,18 +225,19 @@ public final class HNSWIndex implements AutoCloseable {
         return Math.max(16L, (long) (n * Math.exp(-l) * 1.2));
     }
 
-    private void insertInternal(final long entityId, final MemorySegment binaryVec) {
-        final int  nodeMaxLayer = randomLevel();
+    private void insertInternal(final long entityId, final MemorySegment binaryVec, final long vectorStoreOffset) {
+        final int nodeMaxLayer = randomLevel();
         final long currentEntryOffset = entryPointOffset;
-        final int  currentTopLayer = topLayer.get();
+        final int currentTopLayer = topLayer.get();
         long entryOffset = currentEntryOffset;
 
         if (entryOffset == -1L) {
             for (int l = nodeMaxLayer; l >= 0; l--) {
-                layers[l].allocateNode(entityId, binaryVec, nodeMaxLayer);
+                layers[l].allocateNode(entityId, nodeMaxLayer, vectorStoreOffset);
             }
             topLayer.set(nodeMaxLayer);
             entryPointOffset = layers[nodeMaxLayer].findOffset(entityId);
+            entryPointEntityId = entityId;
             return;
         }
 
@@ -272,13 +256,13 @@ public final class HNSWIndex implements AutoCloseable {
 
         final int insertTopLayer = Math.min(nodeMaxLayer, currentTopLayer);
         for (int l = nodeMaxLayer; l > insertTopLayer; l--) {
-            layers[l].allocateNode(entityId, binaryVec, nodeMaxLayer);
+            layers[l].allocateNode(entityId, nodeMaxLayer, vectorStoreOffset);
         }
 
         final SearchContext ctx = searchContextPool.get();
 
         for (int l = insertTopLayer; l >= 0; l--) {
-            final long newNodeOffset = layers[l].allocateNode(entityId, binaryVec, nodeMaxLayer);
+            final long newNodeOffset = layers[l].allocateNode(entityId, nodeMaxLayer, vectorStoreOffset);
 
             ctx.candidates.reset();
             ctx.results.reset();
@@ -300,7 +284,10 @@ public final class HNSWIndex implements AutoCloseable {
         if (nodeMaxLayer > currentTopLayer) {
             topLayer.set(nodeMaxLayer);
             final long ep = layers[nodeMaxLayer].findOffset(entityId);
-            if (ep >= 0) entryPointOffset = ep;
+            if (ep >= 0) {
+                entryPointOffset = ep;
+                entryPointEntityId = entityId;
+            }
         }
     }
 
@@ -345,64 +332,11 @@ public final class HNSWIndex implements AutoCloseable {
 
         for (int i = 0; i < resultCount; i++) {
             final long nodeOffset = resultsBuffer.offsetAt(i);
-            entityIds[i]    = layers[0].viewAt(nodeOffset).getEntityId();
-            distances[i]    = resultsBuffer.distanceAt(i);
+            entityIds[i] = layers[0].viewAt(nodeOffset).getEntityId();
+            distances[i] = resultsBuffer.distanceAt(i);
             similarities[i] = VectorMath.similarity(distances[i]);
         }
         return new SearchResults(entityIds, distances, similarities, resultCount);
-    }
-
-    private SearchResults bruteForceInternal(final MemorySegment query, final int k) {
-        final long nodeCount = layers[0].nodeCount();
-        if (nodeCount == 0) {
-            return new SearchResults(new long[0], new long[0], new double[0], 0);
-        }
-
-        final int cap = (int) Math.min(nodeCount, k);
-        final long[] topOffsets   = new long[cap];
-        final long[] topDistances = new long[cap];
-        int found = 0;
-        long worstDist = Long.MAX_VALUE;
-
-        for (long slot = 0; slot < nodeCount; slot++) {
-            final long offset = slot * HNSWConfig.NODE_BYTES;
-            final long dist   = layers[0].viewAt(offset).getVectorDistance(query);
-
-            if (found < cap) {
-                topOffsets[found]   = offset;
-                topDistances[found] = dist;
-                found++;
-                if (found == cap) {
-                    worstDist = maxOf(topDistances, cap);
-                }
-            } else if (dist < worstDist) {
-                final int wi = indexOfMax(topDistances, cap);
-                topOffsets[wi]   = offset;
-                topDistances[wi] = dist;
-                worstDist = maxOf(topDistances, cap);
-            }
-        }
-
-        for (int i = 1; i < found; i++) {
-            final long keyOff = topOffsets[i];
-            final long keyDist = topDistances[i];
-            int j = i - 1;
-            while (j >= 0 && topDistances[j] > keyDist) {
-                topOffsets[j + 1] = topOffsets[j];
-                topDistances[j + 1] = topDistances[j];
-                j--;
-            }
-            topOffsets[j + 1] = keyOff;
-            topDistances[j + 1] = keyDist;
-        }
-
-        final long[] entityIds = new long[found];
-        final double[] similarities = new double[found];
-        for (int i = 0; i < found; i++) {
-            entityIds[i] = layers[0].viewAt(topOffsets[i]).getEntityId();
-            similarities[i] = VectorMath.similarity(topDistances[i]);
-        }
-        return new SearchResults(entityIds, topDistances, similarities, found);
     }
 
     private static long maxOf(final long[] a, final int len) {
@@ -427,6 +361,16 @@ public final class HNSWIndex implements AutoCloseable {
         final double r = ThreadLocalRandom.current().nextDouble();
         final double safe = r == 0.0 ? Double.MIN_VALUE : r;
         return Math.min((int) (-Math.log(safe) * HNSWConfig.ML), maxLayerCount - 1);
+    }
+
+    private ThreadLocal<SearchContext> buildContextPool(final long maxNodes) {
+        return ThreadLocal.withInitial(() ->
+                new SearchContext(
+                        new CandidateMinHeap(HNSWConfig.EF_CONSTRUCTION),
+                        new TopKBuffer(HNSWConfig.EF_CONSTRUCTION),
+                        new VisitedTracker(new OffHeapAllocator(maxNodes), maxNodes)
+                )
+        );
     }
 
     /**

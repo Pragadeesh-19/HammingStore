@@ -19,14 +19,40 @@ import java.util.Optional;
  * configuration (embedding dimensions and seed) so that reopening the index with an
  * incompatible configuration is caught immediately rather than silently producing
  * wrong results.
+ * <h2>SCHEMA_V2 change</h2>
+ * <p>The field at byte offset 48 has changed semantics:
+ * <ul>
+ *   <li><b>SCHEMA_V1</b>: {@code hnswEntryPointOffset} - a byte offset into the
+ *       top layer's node storage. Computed as {@code slotIndex × 1,536}.</li>
+ *   <li><b>SCHEMA_V2</b>: {@code hnswEntryPointEntityId} - the entity ID of the
+ *       entry-point node. On restore, the current byte offset is derived by
+ *       calling {@code layers[topLayer].findOffset(entityId)}.</li>
+ * </ul>
+ * <p>Storing the entity ID makes the snapshot layout-independent: the byte
+ * offset changes whenever {@link io.hammingstore.hnsw.HNSWConfig#NODE_BYTES}
+ * changes, but the entity ID never does.
  *
- * <p>The snapshot is written via 2 phase commit: data is written to a temporary file
- * flushed to the OS buffer cache, then automatically renamed over the live file.
- * A crash between the flush and the rename leaves the previous snapshot intact.
+ * <p><b>SCHEMA_V1 snapshots are not compatible</b> with SCHEMA_V2 node layout
+ * (1,536 vs 272 bytes/node). {@link #readFrom} detects V1 and throws
+ * {@link IllegalStateException} with a clear migration message.
  *
- * <p>Binary layout:  {@value #SNAPSHOT_BYTES} bytes, little-endian.
- * The first 8-bytes are a fixed magic number ({@value #MAGIC_HEX}) that guards
- * against reading unrelated files.
+ * <h2>Binary layout — SCHEMA_V2 (256 bytes, little-endian)</h2>
+ * <pre>
+ * Offset  Size  Field
+ * ------  ----  -----
+ *      0     8  magic (0x4859504552494F4E = "HYPERION" in ASCII)
+ *      8     4  schemaVersion (int) — must be 2
+ *     12     4  inputDimensions (int)
+ *     16     8  projectionSeed (long)
+ *     24     8  vectorCursorSlots (long)
+ *     32     8  indexEntryCount (long)
+ *     40     4  hnswTopLayer (int)
+ *     44     4  hnswLayerCount (int)
+ *     48     8  hnswEntryPointEntityId (long, -1 = no entry point)
+ *     56    64  layerNodeCounts[8] (8 × long)
+ *    120    64  nodeIndexSizes[8] (8 × long)
+ *    184    72  (reserved / padding to 256)
+ * </pre>
  */
 public final class EngineSnapshot {
 
@@ -35,17 +61,21 @@ public final class EngineSnapshot {
      * Spells "HYPERION" in ASCII
      */
     private static final long MAGIC = 0x4859504552494F4EL;
-    private static final String MAGIC_HEX = "0x4859504552494F4EL";
 
     /** The only schema version this implementation can read or write */
     private static final int SCHEMA_V1 = 1;
+
+    /**
+     * SCHEMA_V2 — node layout without embedded vector (NODE_BYTES = 272).
+     * Entry point stored as entity ID rather than byte offset.
+     */
+    private static final int SCHEMA_V2 = 2;
 
     /** Fixed byte size of the snapshot buffer */
     private static final int SNAPSHOT_BYTES = 256;
 
     /** Maximum number of HNSW layers recorded in a snapshot */
     public static final int MAX_LAYERS = 8;
-
 
     private static final String SNAPSHOT_FILENAME = "snapshot.dat";
     private static final String SNAPSHOT_TMP_FILENAME = "snapshot.dat.tmp";
@@ -57,7 +87,7 @@ public final class EngineSnapshot {
     private final long indexEntryCount;
     private final int hnswTopLayer;
     private final int hnswLayerCount;
-    private final long hnswEntryPointOffset;
+    private final long hnswEntryPointEntityId;
     private final long[] layerNodeCounts;
     private final long[] nodeIndexSizes;
 
@@ -78,7 +108,7 @@ public final class EngineSnapshot {
             final long indexEntryCount,
             final int hnswTopLayer,
             final int hnswLayerCount,
-            final long hnswEntryPointOffset,
+            final long hnswEntryPointEntityId,
             final long[] layerNodeCounts,
             final long[] nodeIndexSizes) {
         this.schemaVersion = schemaVersion;
@@ -88,29 +118,30 @@ public final class EngineSnapshot {
         this.indexEntryCount = indexEntryCount;
         this.hnswTopLayer = hnswTopLayer;
         this.hnswLayerCount = hnswLayerCount;
-        this.hnswEntryPointOffset = hnswEntryPointOffset;
+        this.hnswEntryPointEntityId = hnswEntryPointEntityId;
         this.layerNodeCounts = layerNodeCounts.clone();
         this.nodeIndexSizes = nodeIndexSizes.clone();
     }
 
     /**
-     * Creates a zero-valued snapshot for a brand new index.
+     * Creates a zero-valued SCHEMA_V2 snapshot for a brand new index.
      *
-     * <p>All cursors and counts are set to zero. The HNSW entry point is set to
-     * {@code -1} to indicate that no node has been inserted yet.
+     * <p>All cursors and counts are zero. The HNSW entry point is -1 to indicate
+     * that no node has been inserted yet.
      *
      * @param inputDimensions the embedding dimension the server was started with
-     * @param projectionSeed the PRNG seed used to generate the projection matrix
-     * @param hnswLayerCount the number of HNSW layers in the index.
-     * @return a fresh snapshot ready to be written to disk.
+     * @param projectionSeed  the PRNG seed used to generate the projection matrix
+     * @param hnswLayerCount  the number of HNSW layers in the index
+     * @return a fresh SCHEMA_V2 snapshot ready to be written to disk
      */
     public static EngineSnapshot fresh(
             final int inputDimensions,
             final long projectionSeed,
             final int hnswLayerCount) {
         return new EngineSnapshot(
-                SCHEMA_V1, inputDimensions, projectionSeed,
-                0L, 0L, 0, hnswLayerCount, -1L,
+                SCHEMA_V2, inputDimensions, projectionSeed,
+                0L, 0L, 0, hnswLayerCount,
+                -1L,
                 new long[MAX_LAYERS], new long[MAX_LAYERS]);
     }
 
@@ -133,14 +164,14 @@ public final class EngineSnapshot {
                 .order(ByteOrder.LITTLE_ENDIAN);
 
         buf.putLong(MAGIC);
-        buf.putInt(schemaVersion);
+        buf.putInt(SCHEMA_V2);
         buf.putInt(inputDimensions);
         buf.putLong(projectionSeed);
         buf.putLong(vectorCursorSlots);
         buf.putLong(indexEntryCount);
         buf.putInt(hnswTopLayer);
         buf.putInt(hnswLayerCount);
-        buf.putLong(hnswEntryPointOffset);
+        buf.putLong(hnswEntryPointEntityId);
         for (int i = 0; i < MAX_LAYERS; i++) buf.putLong(layerNodeCounts[i]);
         for (int i = 0; i < MAX_LAYERS; i++) buf.putLong(nodeIndexSizes[i]);
         buf.flip();
@@ -189,9 +220,21 @@ public final class EngineSnapshot {
         }
 
         final int schemaVersion = buf.getInt();
-        if (schemaVersion != SCHEMA_V1) {
+
+        if (schemaVersion == SCHEMA_V1) {
             throw new IllegalStateException(
-                    "snapshot.dat schema version " + schemaVersion + " is not supported (expected " + SCHEMA_V1 + ")");
+                    "snapshot.dat is SCHEMA_V1 (node layout 1,536 bytes/node) and is not "
+                            + "compatible with this build (SCHEMA_V2, 272 bytes/node). "
+                            + "Migration required: stop the server, delete snapshot.dat and "
+                            + "all hnsw_nodes_L*.dat files, then restart to re-index from the "
+                            + "vector_store.dat which remains intact. "
+                            + "See docs/MIGRATION_V1_V2.md for full instructions.");
+        }
+
+        if (schemaVersion != SCHEMA_V2) {
+            throw new IllegalStateException(
+                    "snapshot.dat schema version " + schemaVersion
+                            + " is not supported (expected " + SCHEMA_V2 + ")");
         }
 
         final int inputDimensions = buf.getInt();
@@ -252,7 +295,7 @@ public final class EngineSnapshot {
 
     public int hnswLayerCount() { return hnswLayerCount; }
 
-    public long hnswEntryPointOffset() { return hnswEntryPointOffset; }
+    public long   hnswEntryPointEntityId() { return hnswEntryPointEntityId; }
 
     public long[] layerNodesCounts() { return layerNodeCounts.clone(); }
 
@@ -264,6 +307,6 @@ public final class EngineSnapshot {
                 + ", indexEntries=" + indexEntryCount
                 + ", hnswLayers=" + hnswLayerCount
                 + ", hnswTopLayer=" + hnswTopLayer
-                + ", entryPoint=" + hnswEntryPointOffset + "}";
+                + ", entryPointEntityId=" + hnswEntryPointEntityId + "}";
     }
 }
