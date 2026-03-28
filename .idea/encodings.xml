@@ -1,12 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="Encoding">
+    <file url="file://$PROJECT_DIR$/hammingstore-benchmark/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/hammingstore-benchmark/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/hammingstore-bom/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/hammingstore-bom/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/hammingstore-client/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/hammingstore-client/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/hammingstore-core/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/hammingstore-core/src/main/resources" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/hammingstore-embeddings/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/hammingstore-embeddings/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/hammingstore-spring-boot-starter/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/hammingstore-spring-boot-starter/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/hammingstore-spring-data/src/main/java" charset="UTF-8" />

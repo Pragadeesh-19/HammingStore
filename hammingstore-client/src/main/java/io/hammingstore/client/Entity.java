@@ -13,11 +13,11 @@ public final class Entity {
     private final Map<String,Object> metadata;
 
     private Entity(final Builder builder) {
-        this.id        = builder.id;
-        this.name      = builder.name;
+        this.id = builder.id;
+        this.name = builder.name;
         this.embedding = builder.embedding == null
                 ? null
-                : builder.embedding.clone(); // defensive copy
+                : builder.embedding.clone();
         this.metadata  = builder.metadata == null
                 ? Collections.emptyMap()
                 : Collections.unmodifiableMap(new HashMap<>(builder.metadata));

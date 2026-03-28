@@ -43,14 +43,13 @@ embedding-cache/
 /data/
 *.npy
 
-benchmark/hammingstore_pb2.py
-benchmark/hammingstore_pb2_grpc.py
-
-benchmark_results.json
-benchmark_report.md
-
 *.dat
 snapshot.json
 
 __pycache__/
 *.pyc
+
+hammingstore-data*/
+hammingstore-data-384*/
+*.tsv
+*.onnx

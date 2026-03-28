@@ -8,7 +8,7 @@ public final class Edge {
     private final String relation;
     private final Entity object;
 
-    private Edge(final Entity subject, final String relation, final Entity object) {
+    public Edge(final Entity subject, final String relation, final Entity object) {
         this.subject = Objects.requireNonNull(subject,"subject must not be null");
         this.relation = Objects.requireNonNull(relation,"relation must not be null");
         this.object = Objects.requireNonNull(object,"object must not be null");

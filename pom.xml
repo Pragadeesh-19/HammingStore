@@ -26,9 +26,11 @@
     <modules>
         <module>hammingstore-core</module>
         <module>hammingstore-client</module>
+        <module>hammingstore-embeddings</module>
         <module>hammingstore-spring-boot-starter</module>
         <module>hammingstore-spring-data</module>
         <module>hammingstore-bom</module>
+        <module>hammingstore-benchmark</module>
     </modules>
 
     <properties>
@@ -152,6 +154,26 @@
                 <groupId>io.github.resilience4j</groupId>
                 <artifactId>resilience4j-core</artifactId>
                 <version>2.1.0</version>
+            </dependency>
+            <dependency>
+                <groupId>io.jhdf</groupId>
+                <artifactId>jhdf</artifactId>
+                <version>0.6.10</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.commons</groupId>
+                <artifactId>commons-compress</artifactId>
+                <version>1.26.1</version>
+            </dependency>
+            <dependency>
+                <groupId>com.microsoft.onnxruntime</groupId>
+                <artifactId>onnxruntime</artifactId>
+                <version>1.17.0</version>
+            </dependency>
+            <dependency>
+                <groupId>io.hammingstore</groupId>
+                <artifactId>hammingstore-embeddings</artifactId>
+                <version>${project.version}</version>
             </dependency>
             <dependency>
                 <groupId>io.hammingstore</groupId>

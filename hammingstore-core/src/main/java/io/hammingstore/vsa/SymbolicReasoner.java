@@ -245,17 +245,31 @@ public final class SymbolicReasoner {
             final long subjectId,
             final long relationId,
             final int k) {
-        final ReasonerScratch ctx = scratchPool.get();
 
+        final Long objectId = repository.lookupEdge(subjectId, relationId);
+        if (objectId != null) {
+            return new HNSWIndex.SearchResults(
+                    new long[]{objectId},
+                    new long[]{0L},
+                    new double[]{1.0},
+                    1);
+        }
+
+        final ReasonerScratch ctx = scratchPool.get();
         VectorMath.permuteN(
                 resolveVector(subjectId, "subject"),
                 SUBJECT_SHIFT, ctx.scratchB, ctx.scratchA);
         VectorMath.permuteN(
                 resolveVector(relationId, "relation"),
                 RELATION_SHIFT, ctx.scratchC, ctx.scratchA);
-
         VectorMath.bind(ctx.scratchB, ctx.scratchC, ctx.scratchA);
-        return repository.searchHNSWBinary(ctx.scratchA, k);
+        final HNSWIndex.SearchResults raw = repository.searchHNSWBinary(ctx.scratchA, k);
+        final long[] decodeIds = new long[raw.count()];
+        for (int i=0; i<raw.count(); i++) {
+            decodeIds[i] = raw.entityId(i) ^ subjectId ^ relationId;
+        }
+        return new HNSWIndex.SearchResults(
+                decodeIds, raw.distance(), raw.similarities(), raw.count());
     }
 
     /**

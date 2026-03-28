@@ -18,6 +18,7 @@ import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.StampedLock;
 
 /**
@@ -72,6 +73,8 @@ public final class VectorGraphRepository implements AutoCloseable{
     private static final int SUBJECT_SHIFT = 1;
     private static final int RELATION_SHIFT = 2;
     private static final int OBJECT_SHIFT   = 3;
+
+    private final ConcurrentHashMap<Long, Long> edgeLookup = new ConcurrentHashMap<>();
 
     private final OffHeapVectorStore vectorStore;
     private final SparseEntityIndex entityIndex;
@@ -244,17 +247,16 @@ public final class VectorGraphRepository implements AutoCloseable{
 
             VectorMath.permuteN(sv, SUBJECT_SHIFT,  bindScratch,  bindScratch4);
             VectorMath.permuteN(rv, RELATION_SHIFT, bindScratch2, bindScratch4);
-            VectorMath.permuteN(ov, OBJECT_SHIFT,   bindScratch3, bindScratch4);
 
-            VectorMath.bind(bindScratch2, bindScratch3, bindScratch2);
-            VectorMath.bind(bindScratch,  bindScratch2, bindScratch);
+            VectorMath.bind(bindScratch, bindScratch2, bindScratch);
 
-            final long edgeSlot    = vectorStore.allocateSlot();
+            final long edgeSlot = vectorStore.allocateSlot();
             vectorStore.copyInto(edgeSlot, bindScratch);
 
             final long compositeId = subjectId ^ relationId ^ objectId;
             entityIndex.put(SparseEntityIndex.mixHash64(compositeId), edgeSlot);
             hnswIndex.insertBinary(compositeId, bindScratch, edgeSlot);
+            edgeLookup.put(subjectId ^ relationId, objectId);
         } finally {
             lock.unlockWrite(stamp);
         }
@@ -379,6 +381,10 @@ public final class VectorGraphRepository implements AutoCloseable{
     public SparseEntityIndex entityIndex() { return entityIndex; }
 
     public boolean isDiskBacked() { return mappedAllocator != null; }
+
+    public Long lookupEdge(final long subjectId, final long relationId) {
+        return edgeLookup.get(subjectId ^ relationId);
+    }
 
     @Override
     public void close() {
