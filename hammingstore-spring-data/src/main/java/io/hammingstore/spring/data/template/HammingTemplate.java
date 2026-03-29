@@ -2,6 +2,7 @@ package io.hammingstore.spring.data.template;
 
 import io.hammingstore.client.*;
 import io.hammingstore.client.config.EntityIdResolver;
+import io.hammingstore.spring.InstrumentedHammingClient;
 import io.hammingstore.spring.data.HammingOperations;
 import io.hammingstore.spring.data.event.BatchCompletedEvent;
 import io.hammingstore.spring.data.event.EntityDeletedEvent;
@@ -21,14 +22,25 @@ public class HammingTemplate<T, ID> implements HammingOperations<T, ID> {
     private static final EntityIdResolver RELATION_RESOLVER =
             EntityIdResolver.forRelations(EntityIdResolver.DEFAULT);
 
+    private final InstrumentedHammingClient instrumentedClient;
+
     protected final HammingClient client;
     protected final ApplicationEventPublisher eventPublisher;
     protected Class<T> entityType;
 
+    public HammingTemplate(final InstrumentedHammingClient instrumentedClient,
+                           final ApplicationEventPublisher eventPublisher) {
+        this.instrumentedClient = Objects.requireNonNull(instrumentedClient,"instrumentedClient must not be null");
+        this.client = instrumentedClient.unwrap();
+        this.eventPublisher = Objects.requireNonNull(eventPublisher, "eventPublisher must not be null");
+    }
+
     public HammingTemplate(final HammingClient client,
                            final ApplicationEventPublisher eventPublisher) {
-        this.client = Objects.requireNonNull(client,"client must not be null");
-        this.eventPublisher = Objects.requireNonNull(eventPublisher, "eventPublisher must not be null");
+        this.instrumentedClient = null;
+        this.client = Objects.requireNonNull(client, "client must not be null");
+        this.eventPublisher = Objects.requireNonNull(eventPublisher,
+                "eventPublisher must not be null");
     }
 
     public void setEntityType(final Class<T> entityType) {
@@ -41,7 +53,13 @@ public class HammingTemplate<T, ID> implements HammingOperations<T, ID> {
         HammingEntityMapper.populateAuditFields(entity, false);
         final long id = HammingEntityMapper.extractId(entity);
         final float[] embedding = HammingEntityMapper.extractEmbedding(entity);
-        client.storeFloat(id, embedding);
+
+        if (instrumentedClient != null) {
+            instrumentedClient.storeFloat(id, embedding);
+        } else {
+            client.storeFloat(id, embedding);
+        }
+
         eventPublisher.publishEvent(new EntitySavedEvent<>(this, entity, TEMPLATE));
         return entity;
     }
@@ -56,7 +74,10 @@ public class HammingTemplate<T, ID> implements HammingOperations<T, ID> {
                     HammingEntityMapper.extractId(e),
                     HammingEntityMapper.extractEmbedding(e)));
         }
-        final BatchResult result = client.storeBatch(requests);
+        final BatchResult result = instrumentedClient != null
+                ? instrumentedClient.storeBatch(requests)
+                : client.storeBatch(requests);
+
         eventPublisher.publishEvent(new BatchCompletedEvent(this, result, TEMPLATE));
         return result;
     }
@@ -72,28 +93,43 @@ public class HammingTemplate<T, ID> implements HammingOperations<T, ID> {
     @Override
     public List<SearchResult> search(final float[] embedding, final int k) {
         Objects.requireNonNull(embedding, "embedding must not be null");
-        return client.search(embedding).topK(k).execute();
+        return instrumentedClient != null
+                ? instrumentedClient.search(embedding).topK(k).execute()
+                : client.search(embedding).topK(k).execute();
     }
 
     @Override
     public void delete(final ID id) {
         final long entityId = ((Number) id).longValue();
-        client.retract(entityId);
+
+        if (instrumentedClient != null) {
+            instrumentedClient.retract(entityId);
+        } else {
+            client.retract(entityId);
+        }
+
         eventPublisher.publishEvent(new EntityDeletedEvent(this, entityId, TEMPLATE));
     }
 
     @Override
     public boolean ping() {
-        return client.ping();
+        return instrumentedClient != null ? instrumentedClient.ping() : client.ping();
     }
 
     public List<Entity> chain(final long startId, final int k, final String... relations) {
         final long start = System.currentTimeMillis();
-        var builder = client.from(startId);
-        for (final String rel : relations) {
-            builder = builder.via(rel);
+        final List<Entity> results;
+
+        if (instrumentedClient != null) {
+            var builder = instrumentedClient.from(startId);
+            for (final String rel : relations) builder = builder.via(rel);
+            results = builder.topK(k).execute();
+        } else {
+            var builder = client.from(startId);
+            for (final String rel : relations) builder = builder.via(rel);
+            results = builder.topK(k).execute();
         }
-        final List<Entity> results = builder.topK(k).execute();
+
         eventPublisher.publishEvent(new QueryExecutedEvent(
                 this, "chain", System.currentTimeMillis() - start,
                 results.size(), TEMPLATE, "chain"));
@@ -101,9 +137,12 @@ public class HammingTemplate<T, ID> implements HammingOperations<T, ID> {
     }
 
     public List<Entity> hop(final long entityId, final String relation, final int k) {
-        final long start = System.currentTimeMillis();
-        final long relId = RELATION_RESOLVER.resolve(relation);
-        final List<Entity> results = client.hop(entityId, relId).topK(k).execute();
+        final long start  = System.currentTimeMillis();
+        final long relId  = RELATION_RESOLVER.resolve(relation);
+        final List<Entity> results = instrumentedClient != null
+                ? instrumentedClient.hop(entityId, relId).topK(k).execute()
+                : client.hop(entityId, relId).topK(k).execute();
+
         eventPublisher.publishEvent(new QueryExecutedEvent(
                 this, "hop", System.currentTimeMillis() - start,
                 results.size(), TEMPLATE, "hop"));
@@ -112,6 +151,8 @@ public class HammingTemplate<T, ID> implements HammingOperations<T, ID> {
 
     public List<Entity> analogy(final String subjectA, final String objectA,
                                 final String subjectB, final int k) {
-        return client.analogy(subjectA, objectA).isTo(subjectB).topK(k).execute();
+        return instrumentedClient != null
+                ? instrumentedClient.analogy(subjectA, objectA).isTo(subjectB).topK(k).execute()
+                : client.analogy(subjectA, objectA).isTo(subjectB).topK(k).execute();
     }
 }

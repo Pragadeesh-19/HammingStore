@@ -23,7 +23,6 @@ public class HammingAutoConfiguration {
     private static final Logger log = Logger.getLogger(HammingAutoConfiguration.class.getName());
 
     @Bean
-    @Primary
     @ConditionalOnMissingBean(HammingClient.class)
     public HammingClient hammingClient(final HammingProperties props) {
         log.info("HammingStore: creating client → endpoint=" + props.getEndpoint()
@@ -36,12 +35,22 @@ public class HammingAutoConfiguration {
                 .poolSize(props.getPoolSize())
                 .timeout(props.getTimeout());
 
-        if (props.isTls()) {
-            builder.tls();
-        } else {
-            builder.plaintext();
-        }
+        if (props.isTls()) builder.tls();
+        else               builder.plaintext();
+
         return builder.build();
+    }
+
+    @Bean
+    @Primary
+    @ConditionalOnMissingBean(InstrumentedHammingClient.class)
+    @ConditionalOnClass(name = "io.micrometer.core.instrument.MeterRegistry")
+    @ConditionalOnBean(type = "io.micrometer.core.instrument.MeterRegistry")
+    public InstrumentedHammingClient instrumentedHammingClient(
+            final HammingClient client,
+            final HammingMetricsBinder binder) {
+        log.info("HammingStore: wrapping client with InstrumentedHammingClient");
+        return new InstrumentedHammingClient(client, binder);
     }
 
     @Bean
