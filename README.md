@@ -31,6 +31,21 @@ Raw JMH JSON: [`benchmark/results/jmh_chain_wikidata_semantic.json`](benchmark/r
 
 ---
 
+## AML Demo
+
+A working demo using the ICIJ Offshore Leaks dataset (1.87M nodes, Panama Papers + Paradise Papers + Pandora Papers).
+
+Five endpoints that are not possible in Neo4j:
+- Fuzzy cross-leak entity screening
+- Shell company risk scoring via vector similarity
+- Beneficial ownership chain traversal (0ms, in-memory BFS)
+- Semantic address clustering for shell factory detection
+- Analogous structure queries
+
+**Repo:** [hammingstore-aml-demo](https://github.com/Pragadeesh-19/hammingstore-aml-demo)
+
+---
+
 ## What Makes it Fast
 
 **Hybrid edge lookup:** Stored edges use an in-memory `HashMap<subjectId XOR relationID, objectId>` - exact lookup that bypasses HNSW entirely. HNSW is the fall approach for approximate reasoning on unseen edges. This is why Recall@1 = 100% on stored edges.
