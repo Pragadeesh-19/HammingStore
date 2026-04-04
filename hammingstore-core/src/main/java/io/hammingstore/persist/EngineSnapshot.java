@@ -13,35 +13,18 @@ import java.util.Optional;
 /**
  * An atomic, versioned snapshot of the engine's durable state.
  *
- * <p>A snapshot captures every cursor and counter needed to reconstruct in-memory
- * data structures after a restart: the vector store cursor, the entity index size,
- * and the per layer node count for HNSW graph. It also records the projection
- * configuration (embedding dimensions and seed) so that reopening the index with an
- * incompatible configuration is caught immediately rather than silently producing
- * wrong results.
- * <h2>SCHEMA_V2 change</h2>
- * <p>The field at byte offset 48 has changed semantics:
- * <ul>
- *   <li><b>SCHEMA_V1</b>: {@code hnswEntryPointOffset} - a byte offset into the
- *       top layer's node storage. Computed as {@code slotIndex × 1,536}.</li>
- *   <li><b>SCHEMA_V2</b>: {@code hnswEntryPointEntityId} - the entity ID of the
- *       entry-point node. On restore, the current byte offset is derived by
- *       calling {@code layers[topLayer].findOffset(entityId)}.</li>
- * </ul>
- * <p>Storing the entity ID makes the snapshot layout-independent: the byte
- * offset changes whenever {@link io.hammingstore.hnsw.HNSWConfig#NODE_BYTES}
- * changes, but the entity ID never does.
+ * <h2>SCHEMA_V3 change (Gap 1 fix — persistent edge HashMap)</h2>
+ * <p>Adds {@code edgeLookupCursor} at byte offset 184 (previously reserved).
+ * This records how many entries have been written to {@code edge_log.dat}
+ * so the in-memory {@code edgeLookup} ConcurrentHashMap can be exactly
+ * replayed on restart.
  *
- * <p><b>SCHEMA_V1 snapshots are not compatible</b> with SCHEMA_V2 node layout
- * (1,536 vs 272 bytes/node). {@link #readFrom} detects V1 and throws
- * {@link IllegalStateException} with a clear migration message.
- *
- * <h2>Binary layout — SCHEMA_V2 (256 bytes, little-endian)</h2>
+ * <h2>Binary layout — SCHEMA_V3 (256 bytes, little-endian)</h2>
  * <pre>
  * Offset  Size  Field
  * ------  ----  -----
  *      0     8  magic (0x4859504552494F4E = "HYPERION" in ASCII)
- *      8     4  schemaVersion (int) — must be 2
+ *      8     4  schemaVersion (int) — must be 3
  *     12     4  inputDimensions (int)
  *     16     8  projectionSeed (long)
  *     24     8  vectorCursorSlots (long)
@@ -51,8 +34,15 @@ import java.util.Optional;
  *     48     8  hnswEntryPointEntityId (long, -1 = no entry point)
  *     56    64  layerNodeCounts[8] (8 × long)
  *    120    64  nodeIndexSizes[8] (8 × long)
- *    184    72  (reserved / padding to 256)
+ *    184     8  edgeLookupCursor (long) — number of entries in edge_log.dat
+ *    192    64  (reserved / padding to 256)
  * </pre>
+ *
+ * <h2>Backward compatibility</h2>
+ * <p>SCHEMA_V2 snapshots are still readable. {@code edgeLookupCursor} is
+ * treated as 0, which causes the edge log to be treated as empty on startup.
+ * This means edges must be re-ingested once after upgrading, but the server
+ * starts cleanly and all entity vectors are intact.
  */
 public final class EngineSnapshot {
 
@@ -70,6 +60,12 @@ public final class EngineSnapshot {
      * Entry point stored as entity ID rather than byte offset.
      */
     private static final int SCHEMA_V2 = 2;
+
+    /**
+     * SCHEMA_V3 — adds edgeLookupCursor at offset 184.
+     * All other fields are identical to V2.
+     */
+    private static final int SCHEMA_V3 = 3;
 
     /** Fixed byte size of the snapshot buffer */
     private static final int SNAPSHOT_BYTES = 256;
@@ -90,6 +86,7 @@ public final class EngineSnapshot {
     private final long hnswEntryPointEntityId;
     private final long[] layerNodeCounts;
     private final long[] nodeIndexSizes;
+    private final long edgeLookupCursor;
 
     /**
      * Constructs a snapshot with explicit values for all fields.
@@ -111,6 +108,23 @@ public final class EngineSnapshot {
             final long hnswEntryPointEntityId,
             final long[] layerNodeCounts,
             final long[] nodeIndexSizes) {
+        this(schemaVersion, inputDimensions, projectionSeed, vectorCursorSlots,
+                indexEntryCount, hnswTopLayer, hnswLayerCount, hnswEntryPointEntityId,
+                layerNodeCounts, nodeIndexSizes, 0L);
+    }
+
+    public EngineSnapshot(
+            final int schemaVersion,
+            final int inputDimensions,
+            final long projectionSeed,
+            final long vectorCursorSlots,
+            final long indexEntryCount,
+            final int hnswTopLayer,
+            final int hnswLayerCount,
+            final long hnswEntryPointEntityId,
+            final long[] layerNodeCounts,
+            final long[] nodeIndexSizes,
+            final long edgeLookupCursor) {
         this.schemaVersion = schemaVersion;
         this.inputDimensions = inputDimensions;
         this.projectionSeed = projectionSeed;
@@ -121,6 +135,7 @@ public final class EngineSnapshot {
         this.hnswEntryPointEntityId = hnswEntryPointEntityId;
         this.layerNodeCounts = layerNodeCounts.clone();
         this.nodeIndexSizes = nodeIndexSizes.clone();
+        this.edgeLookupCursor = edgeLookupCursor;
     }
 
     /**
@@ -164,7 +179,7 @@ public final class EngineSnapshot {
                 .order(ByteOrder.LITTLE_ENDIAN);
 
         buf.putLong(MAGIC);
-        buf.putInt(SCHEMA_V2);
+        buf.putInt(SCHEMA_V3);
         buf.putInt(inputDimensions);
         buf.putLong(projectionSeed);
         buf.putLong(vectorCursorSlots);
@@ -174,6 +189,7 @@ public final class EngineSnapshot {
         buf.putLong(hnswEntryPointEntityId);
         for (int i = 0; i < MAX_LAYERS; i++) buf.putLong(layerNodeCounts[i]);
         for (int i = 0; i < MAX_LAYERS; i++) buf.putLong(nodeIndexSizes[i]);
+        buf.putLong(edgeLookupCursor);
         buf.flip();
 
         try (FileChannel fc = FileChannel.open(tmpPath,
@@ -224,17 +240,15 @@ public final class EngineSnapshot {
         if (schemaVersion == SCHEMA_V1) {
             throw new IllegalStateException(
                     "snapshot.dat is SCHEMA_V1 (node layout 1,536 bytes/node) and is not "
-                            + "compatible with this build (SCHEMA_V2, 272 bytes/node). "
-                            + "Migration required: stop the server, delete snapshot.dat and "
-                            + "all hnsw_nodes_L*.dat files, then restart to re-index from the "
-                            + "vector_store.dat which remains intact. "
-                            + "See docs/MIGRATION_V1_V2.md for full instructions.");
+                            + "compatible with this build (SCHEMA_V3, 272 bytes/node). "
+                            + "Migration: stop the server, delete snapshot.dat and all "
+                            + "hnsw_nodes_L*.dat files, then restart to re-index.");
         }
 
-        if (schemaVersion != SCHEMA_V2) {
+        if (schemaVersion != SCHEMA_V2 && schemaVersion != SCHEMA_V3) {
             throw new IllegalStateException(
                     "snapshot.dat schema version " + schemaVersion
-                            + " is not supported (expected " + SCHEMA_V2 + ")");
+                            + " is not supported (expected 2 or 3)");
         }
 
         final int inputDimensions = buf.getInt();
@@ -250,9 +264,11 @@ public final class EngineSnapshot {
         for (int i = 0; i < MAX_LAYERS; i++) layerNodesCounts[i] = buf.getLong();
         for (int i = 0; i < MAX_LAYERS; i++) nodeIndexSizes[i]   = buf.getLong();
 
+        final long edgeLookupCursor = buf.remaining() >= 8 ? buf.getLong() : 0L;
+
         return Optional.of(new EngineSnapshot(
                 schemaVersion, inputDimensions, projectionSeed, vectorCursorSlots, indexEntryCount,
-                hnswTopLayer, hnswLayerCount, hnswEntryPointOffset, layerNodesCounts, nodeIndexSizes));
+                hnswTopLayer, hnswLayerCount, hnswEntryPointOffset, layerNodesCounts, nodeIndexSizes, edgeLookupCursor));
     }
 
     /**
@@ -301,12 +317,15 @@ public final class EngineSnapshot {
 
     public long[] nodeIndexSizes() { return nodeIndexSizes.clone(); }
 
+    public long edgeLookupCursor() { return edgeLookupCursor; }
+
     @Override
     public String toString() {
         return "EngineSnapshot{vectors=" + vectorCursorSlots
                 + ", indexEntries=" + indexEntryCount
                 + ", hnswLayers=" + hnswLayerCount
                 + ", hnswTopLayer=" + hnswTopLayer
-                + ", entryPointEntityId=" + hnswEntryPointEntityId + "}";
+                + ", entryPointEntityId=" + hnswEntryPointEntityId
+                + ", edgeLookupCursor=}" + edgeLookupCursor + "}";
     }
 }

@@ -16,10 +16,12 @@ import io.hammingstore.vsa.RandomProjectionEncoder;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.StampedLock;
+import java.util.logging.Logger;
 
 /**
  * Central access point for storing and retrieving binary hypervectors.
@@ -63,18 +65,23 @@ import java.util.concurrent.locks.StampedLock;
  */
 public final class VectorGraphRepository implements AutoCloseable{
 
+    private static final Logger log = Logger.getLogger(VectorGraphRepository.class.getName());
+
     /**
      * Byte size of one vector slot in the flat store.
      * Alias for {@link BinaryVector#VECTOR_BYTES} kept private to reduce noise
      * inside this class.
      */
     private static final long SLOT_BYTES = BinaryVector.VECTOR_BYTES;
+    private static final long EDGE_LOG_BYTES = 16L;
 
     private static final int SUBJECT_SHIFT = 1;
     private static final int RELATION_SHIFT = 2;
     private static final int OBJECT_SHIFT   = 3;
 
     private final ConcurrentHashMap<Long, Long> edgeLookup = new ConcurrentHashMap<>();
+    private final MemorySegment edgeLog;
+    private long edgeCursor;
 
     private final OffHeapVectorStore vectorStore;
     private final SparseEntityIndex entityIndex;
@@ -110,6 +117,8 @@ public final class VectorGraphRepository implements AutoCloseable{
         this.hnswIndex = new HNSWIndex(maxVectors, vectorStore);
         this.mappedAllocator = null;
         this.dataDir = null;
+        this.edgeLog = null;
+        this.edgeCursor = 0L;
         this.encodeScratch = ThreadLocal.withInitial(() ->
                 allocator.allocateRawSegment(SLOT_BYTES, Long.BYTES));
     }
@@ -247,7 +256,6 @@ public final class VectorGraphRepository implements AutoCloseable{
 
             VectorMath.permuteN(sv, SUBJECT_SHIFT,  bindScratch,  bindScratch4);
             VectorMath.permuteN(rv, RELATION_SHIFT, bindScratch2, bindScratch4);
-
             VectorMath.bind(bindScratch, bindScratch2, bindScratch);
 
             final long edgeSlot = vectorStore.allocateSlot();
@@ -256,7 +264,10 @@ public final class VectorGraphRepository implements AutoCloseable{
             final long compositeId = subjectId ^ relationId ^ objectId;
             entityIndex.put(SparseEntityIndex.mixHash64(compositeId), edgeSlot);
             hnswIndex.insertBinary(compositeId, bindScratch, edgeSlot);
-            edgeLookup.put(subjectId ^ relationId, objectId);
+
+            final long edgeKey = subjectId ^ relationId;
+            appendEdgeToLog(edgeKey, objectId);
+            edgeLookup.put(edgeKey, objectId);
         } finally {
             lock.unlockWrite(stamp);
         }
@@ -301,6 +312,7 @@ public final class VectorGraphRepository implements AutoCloseable{
         final long hnswEntryPtEntityId;
         final long[] layerNodeCounts = new long[EngineSnapshot.MAX_LAYERS];
         final long[] nodeIdxSizes    = new long[EngineSnapshot.MAX_LAYERS];
+        final long committedEdgeCursor;
 
         final long stamp = lock.readLock();
         try {
@@ -308,6 +320,7 @@ public final class VectorGraphRepository implements AutoCloseable{
             idxCount = entityIndex.size();
             hnswTopLayer = hnswIndex.activeLayerCount() - 1;
             hnswEntryPtEntityId = hnswIndex.entryPointEntityId();
+            committedEdgeCursor = edgeCursor;
             final int layerCount = hnswIndex.activeLayerCount();
             for (int l = 0; l < Math.min(layerCount, EngineSnapshot.MAX_LAYERS); l++) {
                 layerNodeCounts[l] = hnswIndex.layer(l).nodeCount();
@@ -329,7 +342,8 @@ public final class VectorGraphRepository implements AutoCloseable{
                 hnswIndex.activeLayerCount(),
                 hnswEntryPtEntityId,
                 layerNodeCounts,
-                nodeIdxSizes);
+                nodeIdxSizes,
+                committedEdgeCursor);
         try {
             snap.writeTo(dataDir);
         } catch (IOException e) {
@@ -390,6 +404,26 @@ public final class VectorGraphRepository implements AutoCloseable{
     public void close() {
         hnswIndex.close();
         if (mappedAllocator != null) mappedAllocator.close();
+    }
+
+    private void appendEdgeToLog(final long edgeKey, final long objectId) {
+        if (edgeLog == null) return;
+
+        final long byteOffset = edgeCursor * EDGE_LOG_BYTES;
+        if (byteOffset + EDGE_LOG_BYTES > edgeLog.byteSize()) {
+            if (edgeCursor % 10_000 == 0) {
+                log.warning(String.format(
+                        "edge_log.dat is full (%,d entries). "
+                                + "Edge will not survive restart. "
+                                + "Increase --max-vectors to persist more edges.",
+                        edgeCursor));
+            }
+            return;
+        }
+
+        edgeLog.set(ValueLayout.JAVA_LONG_UNALIGNED, byteOffset, edgeKey);
+        edgeLog.set(ValueLayout.JAVA_LONG_UNALIGNED, byteOffset + 8, objectId);
+        edgeCursor++;
     }
 
     private MemorySegment resolveVector(final long entityId, final String role) {
@@ -494,8 +528,36 @@ public final class VectorGraphRepository implements AutoCloseable{
         final MemorySegment bindScratch3 = scratchAlloc.allocateRawSegment(SLOT_BYTES, Long.BYTES);
         final MemorySegment bindScratch4 = scratchAlloc.allocateRawSegment(SLOT_BYTES, Long.BYTES);
 
+        final long edgeLogBytes = maxVectors * EDGE_LOG_BYTES;
+        final MemorySegment edgeLog = mfa.map("edge_log.dat", edgeLogBytes);
+
+        final long committedEdges = snap.edgeLookupCursor();
+        final ConcurrentHashMap<Long, Long> edgeLookup = new ConcurrentHashMap<>(
+                (int) Math.min(committedEdges * 2, Integer.MAX_VALUE));
+
+        if (committedEdges > 0) {
+            log.info(String.format(
+                    "Replaying %,d edges from edge_log.dat...", committedEdges));
+            for (long i = 0; i < committedEdges; i++) {
+                final long offset = i * EDGE_LOG_BYTES;
+                final long edgeKey = edgeLog.get(ValueLayout.JAVA_LONG_UNALIGNED, offset);
+                final long objectId = edgeLog.get(ValueLayout.JAVA_LONG_UNALIGNED, offset + 8);
+                edgeLookup.put(edgeKey, objectId);
+            }
+            log.info(String.format(
+                    "Edge replay complete: %,d edges restored in O(N). "
+                            + "Chain traversal is fully operational.",
+                    edgeLookup.size()));
+        } else {
+            log.info("edge_log.dat: no committed edges (fresh database or V2 migration). "
+                    + "Re-ingest edges to populate the persistent edge log.");
+        }
+
         return new VectorGraphRepository(
-                vectorStore, entityIndex, hnswIndex, encoder, bindScratch, bindScratch2, bindScratch3, bindScratch4, mfa, dataDir);
+                vectorStore, entityIndex, hnswIndex, encoder,
+                bindScratch, bindScratch2, bindScratch3, bindScratch4,
+                mfa, dataDir,
+                edgeLog, committedEdges, edgeLookup);
     }
 
     private VectorGraphRepository(
@@ -508,7 +570,10 @@ public final class VectorGraphRepository implements AutoCloseable{
             final MemorySegment bindScratch3,
             final MemorySegment bindScratch4,
             final MappedFileAllocator mappedAllocator,
-            final Path dataDir) {
+            final Path dataDir,
+            final MemorySegment edgeLog,
+            final long edgeCursor,
+            final ConcurrentHashMap<Long, Long> edgeLookupSeed) {
         this.vectorStore = vectorStore;
         this.entityIndex = entityIndex;
         this.hnswIndex = hnswIndex;
@@ -519,6 +584,9 @@ public final class VectorGraphRepository implements AutoCloseable{
         this.bindScratch4 = bindScratch4;
         this.mappedAllocator  = mappedAllocator;
         this.dataDir = dataDir;
+        this.edgeLog = edgeLog;
+        this.edgeCursor = edgeCursor;
+        this.edgeLookup.putAll(edgeLookupSeed);
         this.encodeScratch = ThreadLocal.withInitial(() -> {
             final OffHeapAllocator a = new OffHeapAllocator(2L);
             return a.allocateRawSegment(SLOT_BYTES, Long.BYTES);
