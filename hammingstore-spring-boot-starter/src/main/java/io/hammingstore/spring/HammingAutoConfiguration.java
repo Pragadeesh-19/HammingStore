@@ -2,6 +2,9 @@ package io.hammingstore.spring;
 
 import io.hammingstore.client.HammingClient;
 import io.hammingstore.client.ServerStatus;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
@@ -45,11 +48,15 @@ public class HammingAutoConfiguration {
     @Primary
     @ConditionalOnMissingBean(InstrumentedHammingClient.class)
     @ConditionalOnClass(name = "io.micrometer.core.instrument.MeterRegistry")
-    @ConditionalOnBean(type = "io.micrometer.core.instrument.MeterRegistry")
     public InstrumentedHammingClient instrumentedHammingClient(
             final HammingClient client,
-            final HammingMetricsBinder binder) {
+            final ObjectProvider<MeterRegistry> registryProvider,
+            final HammingProperties props) {
+        final io.micrometer.core.instrument.MeterRegistry registry =
+                registryProvider.getIfAvailable(SimpleMeterRegistry::new);
         log.info("HammingStore: wrapping client with InstrumentedHammingClient");
+        final HammingMetricsBinder binder = new HammingMetricsBinder(registry, client, props);
+        binder.afterSingletonsInstantiated();
         return new InstrumentedHammingClient(client, binder);
     }
 

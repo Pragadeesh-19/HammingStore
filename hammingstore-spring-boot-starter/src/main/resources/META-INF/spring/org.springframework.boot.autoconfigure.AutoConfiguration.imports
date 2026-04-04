@@ -1,1 +1,2 @@
 io.hammingstore.spring.HammingAutoConfiguration
+io.hammingstore.spring.watch.WatchAutoConfiguration

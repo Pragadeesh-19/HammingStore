@@ -2,6 +2,7 @@ package io.hammingstore.spring;
 
 import io.hammingstore.client.*;
 import io.hammingstore.client.query.*;
+import io.hammingstore.spring.watch.WatchRegistry;
 import io.micrometer.core.instrument.Timer;
 
 import java.util.List;
@@ -12,6 +13,7 @@ public final class InstrumentedHammingClient implements AutoCloseable{
 
     private final HammingClient delegate;
     private final HammingMetricsBinder binder;
+    private volatile WatchRegistry watchRegistry;
 
     public InstrumentedHammingClient(final HammingClient delegate,
                                      final HammingMetricsBinder binder) {
@@ -21,12 +23,22 @@ public final class InstrumentedHammingClient implements AutoCloseable{
 
     public HammingClient unwrap() { return delegate; }
 
+    public void setWatchRegistry(final WatchRegistry watchRegistry) {
+        this.watchRegistry = watchRegistry;
+    }
+
     public void storeFloat(final long entityId, final float[] embedding) {
         binder.storeFloatTimer().record(() -> delegate.storeFloat(entityId, embedding));
+
+        final WatchRegistry wr = this.watchRegistry;
+        if (wr != null) wr.check(entityId, embedding);
     }
 
     public void storeFloat(final String entityName, final float[] embedding) {
         binder.storeFloatTimer().record(() -> delegate.storeFloat(entityName, embedding));
+
+        final WatchRegistry wr = this.watchRegistry;
+        if (wr != null) wr.check(Entity.defaultId(entityName), embedding);
     }
 
     public void storeEdge(final Edge edge) {
@@ -37,6 +49,13 @@ public final class InstrumentedHammingClient implements AutoCloseable{
         binder.batchSizeSummary().record(requests.size());
         final BatchResult result = delegate.storeBatch(requests);
         binder.batchFailureCounter().increment(result.failureCount());
+
+        final WatchRegistry wr = this.watchRegistry;
+        if (wr != null) {
+            for (final StoreRequest req : requests) {
+                wr.check(req.entityId(), req.embedding());
+            }
+        }
         return result;
     }
 
