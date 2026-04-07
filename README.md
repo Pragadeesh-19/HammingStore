@@ -1,250 +1,174 @@
 # HammingStore
 
-> **2.07ms 2-hop · 2.01ms 3-hop · 3.65ms 4-hop · 100% Recall@1**
-> Multi-hop knowledge graph traversal in a single gRPC call. No Python. No Neo4j. Pure JVM
+An embeddable graph database for the JVM that detects hidden patterns in financial crime networks.
 
-HammingStore is a binary hypervector engine that stores any float embedding as a 10,048 binary vector and traverses knowledge graph at sub-millisecond-per-hop latency. It ships as a stand along gRPC server, a java client, and a spring boot autoconfiguration. 
+Most AML systems stitch together a graph database and a vector database - two separate processes,
+two query paths, two points of failure - to do what HammingStore does in one call.
+
+```java
+// Screen an entity against 1.87M Panama Papers nodes in one call
+client.search(encoder.encode("Mossack Fonseca")).topK(10).execute();
+
+// Trace 4-hop beneficial ownership chain — single gRPC call, ~3.65ms
+client.from(companyId)
+      .via(REL_OFFICER_OF)
+      .via(REL_OFFICER_OF)
+      .via(REL_OFFICER_OF)
+      .via(REL_OFFICER_OF)
+      .topK(5).execute();
+
+// Risk score against statistical centroid of 500k real Panama Papers shells
+amlService.shellRiskScore(entityId); // returns 0.0–1.0
+```
 
 ---
 
-## Benchmark Results
+## What it does
 
-Measured on Wikidata: **646,777 entities · 1,298,419 edges · MiniLM-L6-v2 semantic embeddings**
-JMH 1.37 · Fork=3 · Warmup=5×2s · Measurement=10×5s · JDK 22.0.2 · Consumer laptop (Windows 11)
+Entities are stored as 10,048-bit binary hypervectors. Typed edges use Vector Symbolic Architecture - XOR binding with cyclic permutation per role - so subject, relation, and object get encoded into a single binary vector. HNSW handles fuzzy search. A memory-mapped hash table handles O(1) exact edge lookup.
 
-```
-Benchmark                   hopCount   Mode   Cnt    Score    Error   Units
-ChainBenchmark.chain           2       avgt    30    2.067  ± 0.078   ms/op
-ChainBenchmark.chain           3       avgt    30    2.012  ± 0.075   ms/op
-ChainBenchmark.chain           4       avgt    30    3.645  ± 0.782   ms/op
-```
-
-**Recall evaluation (200 randomly sampled stored edges):**
-```
-Recall@1  : 100.0%
-Recall@10 : 100.0%
-```
-
-All hops execute server-side in a single gRPC call - no application-layer loop, no multiple round trips. 
-
-Raw JMH JSON: [`benchmark/results/jmh_chain_wikidata_semantic.json`](benchmark/results/jmh_chain_wikidata_semantic.json)
+The result: graph traversal and semantic similarity search share the same data structure. You don't need Pinecone alongside Neo4j. You don't need a Python service to handle the embeddings. You add one Maven dependency.
 
 ---
 
-## AML Demo
+## Benchmarks
 
-A working demo using the ICIJ Offshore Leaks dataset (1.87M nodes, Panama Papers + Paradise Papers + Pandora Papers).
+**Wikidata - 646k entities - JMH - Windows 11**
 
-Five endpoints that are not possible in Neo4j:
-- Fuzzy cross-leak entity screening
-- Shell company risk scoring via vector similarity
-- Beneficial ownership chain traversal (0ms, in-memory BFS)
-- Semantic address clustering for shell factory detection
-- Analogous structure queries
+| Operation | Avg | p99 |
+|-----------|-----|-----|
+| 2-hop chain traversal | 2.07ms | 2.46ms |
+| 3-hop chain traversal | 2.01ms | 2.38ms |
+| 4-hop chain traversal | 3.65ms | 4.12ms |
+| HNSW search (topK=10) | 1.84ms | - |
 
-**Repo:** [hammingstore-aml-demo](https://github.com/Pragadeesh-19/hammingstore-aml-demo)
+**ICIJ Offshore Leaks - 1.87M entities - Panama + Paradise + Pandora Papers**
 
----
+| Endpoint | Latency |
+|----------|---------|
+| `/api/screen` - fuzzy name match across all three leaks | 886ms |
+| `/api/shell-risk/{id}` - Hamming distance to shell prototype | 290–1748ms |
+| `/api/analogous/{id}` - VSA analogy query | 439ms |
+| `/api/address-cluster` - semantic address search | 1141ms |
+| `/api/ownership/{id}` - 4-hop beneficial ownership chain | 0ms* |
 
-## What Makes it Fast
+*The ownership chain uses an in-memory BFS index built at load time, not a live gRPC traversal.
+I'm flagging it because 0ms on a 4-hop query sounds implausible without that context.
 
-**Hybrid edge lookup:** Stored edges use an in-memory `HashMap<subjectId XOR relationID, objectId>` - exact lookup that bypasses HNSW entirely. HNSW is the fall approach for approximate reasoning on unseen edges. This is why Recall@1 = 100% on stored edges.
-
-**Binary Hypervectors:** 10,048 bits per vector (1,256 bytes). Hamming distance = `Long.bitCount(a XOR b)` accross 157 longs - no SIMD, no floating-point, no allocation on the hot path. 
-
-**Role-encoded VSA binding:** `storeTypedEdge` stores `bind(permute(S,1), permute(R,2))`. Each role gets a distinct cyclic bit shift before XOR binding, eliminating cross-relation interference. Decode: `objectId = compositeId XOR subjectId XOR relationId`. 
-
-**Zero GC after warmup:** All vectors live in off-heap `MemorySegment` via the Java 22 FFM API. HNSW graph, entity index, and vector store are memory-mapped files. No `byte[]`, no `float[]` on the hot query path.
+All numbers are on a consumer laptop on Windows. Linux benchmarks are on the roadmap.
 
 ---
 
 ## Quickstart
 
-### 1. Start the server
+**Run the AML demo (requires pre-ingested data):**
 
 ```bash
-java --add-modules=jdk.random -XX:MaxDirectMemorySize=8g \
-  -jar hammingstore-core/target/hammingstore-core-1.0.0-SNAPSHOT.jar \
-  --port=50051 --dims=384 --max-vectors=1000000
+# Clone both repos as siblings
+git clone https://github.com/Pragadeesh-19/HammingStore
+git clone https://github.com/Pragadeesh-19/hammingstore-aml-demo
+
+# Configure data paths
+cd HammingStore
+cp env.example .env
+# Edit .env: set HAMMINGSTORE_DATA_DIR and OFFSHORE_LEAKS_DIR
+
+# Start everything
+docker-compose up
 ```
 
-### 2. Add the client dependency
+Then:
+```bash
+curl -s http://localhost:8081/api/screen \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Mossack Fonseca","topK":5}' | jq .
+```
+
+**Add to an existing Spring Boot project:**
 
 ```xml
 <dependency>
-  <groupId>io.hammingstore</groupId>
-  <artifactId>hammingstore-client</artifactId>
-  <version>1.0.0-SNAPSHOT</version>
-</dependency>
-```
-
-### 3. Store and traverse
- 
-```java
-try (HammingClient client = HammingClient.builder()
-        .endpoint("localhost", 50051)
-        .plaintext()
-        .build()) {
- 
-    client.storeFloat(PARIS_ID, encode("Paris"));
-    client.storeFloat(FRANCE_ID, encode("France"));
-    client.storeFloat(EUROPE_ID, encode("Europe"));
-
-    client.storeEdge(new Edge(Entity.of(PARIS_ID), "locatedIn", Entity.of(FRANCE_ID)));
-    client.storeEdge(new Edge(Entity.of(FRANCE_ID), "locatedIn", Entity.of(EUROPE_ID)));
- 
-    // 2-hop chain
-    List<Entity> result = client
-        .from(PARIS_ID)
-        .via("locatedIn")
-        .via("locatedIn")
-        .topK(5)
-        .execute();
-    // result[0] = Europe
-}
-```
-
----
-
-## Spring Boot Integration
-
-```xml
-<dependency>
-  <groupId>io.hammingstore</groupId>
-  <artifactId>hammingstore-spring-boot-starter</artifactId>
-  <version>1.0.0-SNAPSHOT</version>
+    <groupId>io.hammingstore</groupId>
+    <artifactId>hammingstore-spring-boot-starter</artifactId>
+    <version>1.0.0</version>
 </dependency>
 ```
 
 ```yaml
+# application.yml
 hammingstore:
   endpoint: localhost:50051
-  tls: false
-  pool-size: 4
-  timeout: 30s
-  verify-on-startup: true
-  expected-dims: 384
 ```
 
 ```java
-@HammingEntity
-public class Location {
-    @HammingId private long    id;
-    @HammingName private String  name;
-    @HammingEmbedding private float[] embedding;
-}
- 
-public interface LocationRepository extends HammingRepository<Location, Long> {
-    @Chain(relations = {"locatedIn", "locatedIn"}, topK = 5)
-    List<Entity> findRegionOf(long cityId);
-}
-```
+@Autowired
+private InstrumentedHammingClient client;
 
-When `io.micrometer:micrometer-core` is on the classpath, all operations are timed automatically via `InstrumentedHammingClient` and visible at:
- 
-```
-GET /actuator/metrics/hammingstore.operation.duration?tag=operation:chain
+// That's it. Micrometer timers, health indicator, and graceful shutdown included.
 ```
 
 ---
 
 ## Architecture
 
-Diagram: Working on it
+```
+1. Generate float embedding (MiniLM-L6-v2, 384 dims)
+2. Apply random projection encoding
+3. Produce a 10,048-bit binary hypervector
 
-**Component summary:**
+This hypervector is stored in:
+- OffHeapVectorStore (mmap FFM) - for raw vectors (zero GC)
+- SparseEntityIndex (mmap) - for entity → slot mapping
+- HNSWIndex (mmap, off-heap) - for approximate nearest neighbor search
+- EdgeLog WAL (mmap) - for persistent typed edges
+```
 
-| Component | Responsibility |
-|-----------|---------------|
-| `HammingGrpcService` | Protobuf serialisation, gRPC endpoint |
-| `VectorGraphRepository` | Coordinates HNSW, HashMap, vector store, entity index |
-| `SymbolicReasoner` | VSA chain traversal, analogy, bundle queries |
-| `RandomProjectionEncoder` | Float→binary binarisation (10,048-bit) |
-| `HNSWIndex` | ANN search — fallback for unseen edges |
-| `HashMap<S^R, O>` | O(1) exact edge lookup for stored edges |
-| `OffHeapVectorStore` | Off-heap `MemorySegment` vector slab (mmap) |
-| `SparseEntityIndex` | Open-addressing hash map: entityId→slot offset |
-| `MappedFileAllocator` | Disk persistence via memory-mapped files |
+Typed edges are stored as `bind(permute(subject, 1), bind(permute(relation, 2), permute(object, 3)))`.
+Chain traversal decodes the binding step-by-step using XOR and inverse permutation.
+No Cypher. No query planner. No JVM heap pressure — the hot path is entirely off-heap via the Foreign Function and Memory API.
 
 ---
 
-## Query Types
+## Use cases
 
-```java
-// Multi-hop chain traversal
-client.from(entityId).via("relation1").via("relation2").topK(10).execute();
- 
-// Single hop
-client.hop(entityId, relationId).topK(10).execute();
- 
-// Analogical reasoning — A:B :: C:?
-client.analogy("London", "England").isTo("Paris").topK(1).execute();
- 
-// Set prototype — nearest concept to a bundle of entities
-client.bundle(id1, id2, id3).topK(5).execute();
- 
-// Nearest-neighbour semantic search
-client.search(embedding).topK(10).execute();
-```
+**AML / KYC**
+Trace beneficial ownership chains through layered corporate structures (FATF Recommendation 24 compliance). Screen entity names against sanctions lists with fuzzy matching that handles transliterations and aliases. Score new entities against a VSA prototype of known shell companies.
+
+**Fraud detection**
+Find structurally similar transaction networks to known fraud patterns using VSA analogy queries. No ML training required - the prototype is built from observed fraud cases using majority-vote bundling.
+
+**Knowledge graphs**
+Multi-hop reasoning across typed relationships in a single JVM process. No external graph database, no Cypher, no network round-trips between query hops.
+
+---
+
+## Honest limitations
+
+- No Python client. Java gRPC or the Spring Boot starter only.
+- No multi-tenancy. One namespace per server instance.
+- Benchmarks are from a consumer laptop on Windows. Reproduce them yourself before trusting them.
+- Zero production deployments. This is an open-source project, not a deployed system.
+- The Watch API fires on every `storeFloat` write. High-volume ingestion may need rate limiting.
+
+---
 
 ## Modules
- 
-| Module | Description |
-|--------|-------------|
-| `hammingstore-core` | gRPC server, HNSW index, VSA reasoning engine, persistence |
-| `hammingstore-client` | Java gRPC client with fluent builder API |
-| `hammingstore-embeddings` | MiniLM-L6-v2 ONNX encoder, 384-dim, pure Java |
-| `hammingstore-spring-boot-starter` | Spring Boot autoconfiguration, health indicator, Micrometer metrics |
-| `hammingstore-spring-data` | Repository pattern, `@HammingEntity`, `@Chain`, `HammingTemplate` |
-| `hammingstore-bom` | Bill of materials for dependency management |
-| `hammingstore-benchmark` | JMH benchmarks, Wikidata SPARQL loader, graph expander |
- 
----
 
-## Building from source
-
-**Requirements:** JDK 22+, Maven 3.9+
- 
-```bash
-# Build all modules
-mvn package -DskipTests
- 
-# Build server only
-mvn package -DskipTests -pl hammingstore-core
- 
-# Run benchmarks (requires running server on localhost:50051)
-java --add-modules=jdk.random -XX:MaxDirectMemorySize=16g \
-  -jar hammingstore-benchmark/target/benchmarks.jar \
-  ".*ChainBenchmark.*" -rf json -rff results.json
-```
-
-## Server Options
- 
-```
---port=<int>          gRPC port (default: 50051)
---max-vectors=<long>  Vector capacity (default: 1,000,000)
---dims=<int>          Input embedding dimensions (default: 384)
---seed=<long>         Projection matrix seed
---data-dir=<path>     Disk persistence directory (RAM-only if omitted)
-```
- 
----
-
-## Persistence
- 
-Data survives server restarts when `--data-dir` is set. All vectors and HNSW graph layers are memory-mapped to disk. Checkpoint is written atomically on shutdown via the JVM shutdown hook.
+| Module | Purpose |
+|--------|---------|
+| `hammingstore-core` | gRPC server, HNSW engine, VSA encoding, persistence |
+| `hammingstore-client` | Java gRPC client |
+| `hammingstore-embeddings` | MiniLM-L6-v2 via ONNX Runtime |
+| `hammingstore-spring-boot-starter` | Spring Boot autoconfiguration, Micrometer, Watch API |
+| `hammingstore-spring-data` | Repository abstraction |
+| `hammingstore-benchmark` | JMH benchmarks, dataset loaders |
 
 ---
 
-## Benchmark Methodology
- 
-- JMH 1.37, JDK 22.0.2 (Java HotSpot 64-bit Server VM)
-- Dataset: Wikidata geographic entities via SPARQL, encoded with `all-MiniLM-L6-v2` (ONNX Runtime)
-- Hardware: consumer laptop, Windows 11 - not a cloud VM
-- Recall: 200 randomly sampled stored edges, both ends confirmed present in server
-- Chain seeds validated for full 4-hop traversal before benchmark run
-- Edge HashMap rebuilt from stored edges after each server restart
- 
+## Contributing
+
+The project needs Linux benchmark numbers, a Python client, and a proper comparison against Neo4j and JanusGraph on a standardized fraud detection workload. If you work on graph databases, AML systems, or HNSW implementations and want to collaborate, open an issue or send a connection request on LinkedIn.
+
 ---
 
 ## License
